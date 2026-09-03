@@ -1,0 +1,10 @@
+# Edita esta lista para ir agregando términos técnicos nuevos.
+# La app carga esta lista y la usa como prompt para Whisper.
+# Puedes también sobreescribirla temporalmente con WHISPER_GLOSSARY en .env.
+
+Reunión técnica
+Dynasub
+Aquabim
+BM5
+As-Built
+

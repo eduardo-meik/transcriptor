@@ -1,0 +1,61 @@
+# Ignore virtual environment
+venv/
+env/
+ENV/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Audio files (optional - remove if you want to track audio files)
+*.mp3
+*.wav
+*.m4a
+*.flac
+*.ogg
+*.aac
+
+# Transcription output files (optional - remove if you want to track outputs)
+outputs/
+*_transcription.txt
+*_transcription.srt
+*_transcription.vtt
+*_transcription.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local secrets
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# folder
+AEX_audios
+AEX_videos

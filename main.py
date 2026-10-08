@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import threading
@@ -16,15 +17,25 @@ from core.transcriber import FasterWhisperTranscriber, TranscriptionConfig, Tran
 
 SPINNER = "|/-\\"
 
+# Peak-amplitude thresholds used to warn about a channel that captured nothing.
+SILENCE_PEAK = 0.0005  # -66 dBFS
+VERY_LOW_PEAK = 0.01  # -40 dBFS
+
 
 def _db(level: float) -> str:
     """Return a short dBFS label for a linear amplitude."""
 
-    import math
-
     if level <= 0:
         return "  -inf"
     return f"{20 * math.log10(level):6.1f}"
+
+
+def _db_label(level: float) -> str:
+    """Return a dBFS label including the unit, for post-recording summaries."""
+
+    if level <= 0:
+        return "-inf dBFS"
+    return f"{20 * math.log10(level):.1f} dBFS"
 
 
 def _run_recording_status(
@@ -61,6 +72,52 @@ def _run_recording_status(
         pass
     sys.stdout.write("\r" + " " * 84 + "\r")
     sys.stdout.flush()
+
+
+def _report_capture_quality(recorder: MeetingAudioRecorder, system_only: bool) -> None:
+    """Report the recorded signal level and warn when a channel captured nothing.
+
+    A silent channel is otherwise invisible: the WAV is still produced and the
+    transcript simply comes back empty, so the problem is only noticed after the
+    meeting is over. Surfacing it here keeps that failure mode visible.
+    """
+
+    peaks = recorder.session_peaks()
+    system_peak = peaks.get("system", 0.0)
+    microphone_peak = peaks.get("microphone", 0.0)
+
+    warnings: list[str] = []
+    if system_peak < SILENCE_PEAK:
+        warnings.append(
+            "El canal de SISTEMA no capturo audio. Causas probables: nadie mas hablo durante "
+            "la grabacion, o Teams cambio de dispositivo de salida."
+        )
+    elif system_peak < VERY_LOW_PEAK:
+        warnings.append("El canal de SISTEMA capturo muy bajo. Revisa el volumen de salida.")
+
+    if not system_only:
+        if microphone_peak < SILENCE_PEAK:
+            warnings.append(
+                "El canal de MICROFONO no capturo audio. Revisa el dispositivo de entrada con "
+                "`python main.py --check-devices`."
+            )
+        elif microphone_peak < VERY_LOW_PEAK:
+            warnings.append("El canal de MICROFONO capturo muy bajo. Revisa el nivel de entrada.")
+
+    print(f"Niveles grabados: sistema {_db_label(system_peak)} | microfono {_db_label(microphone_peak)}")
+    if not warnings:
+        return
+
+    print("")
+    print("=" * 68)
+    print(" AVISO: la grabacion puede estar incompleta")
+    print("=" * 68)
+    for warning in warnings:
+        print(f" - {warning}")
+    print("")
+    print(" Diagnostico: python check_capture.py test")
+    print("=" * 68)
+    print("")
 
 
 def _start_stop_watcher(stop_event: threading.Event) -> None:
@@ -199,6 +256,7 @@ def main() -> int:
 
         recording = recorder.stop()
         print(f"Saved mixed audio: {recording.mixed_wav}")
+        _report_capture_quality(recorder, args.system_only)
 
         transcriber = FasterWhisperTranscriber(transcriber_config)
         if transcriber_config.use_whisperx or transcriber_config.diarize:

@@ -111,6 +111,9 @@ class MeetingAudioRecorder:
         self._microphone_raw_path: Path | None = None
         self._level_lock = threading.Lock()
         self._levels: dict[str, float] = {"system": 0.0, "microphone": 0.0}
+        # Peak per source across the whole session, so a silent channel can be
+        # reported after recording instead of only being noticed in the transcript.
+        self._session_peaks: dict[str, float] = {"system": 0.0, "microphone": 0.0}
 
     def levels(self) -> dict[str, float]:
         """Return peak amplitude per source since the last call, then reset it."""
@@ -120,6 +123,15 @@ class MeetingAudioRecorder:
             self._levels = {key: 0.0 for key in self._levels}
         if self._loopback is not None:
             snapshot["system"] = max(snapshot.get("system", 0.0), self._loopback.levels())
+        return snapshot
+
+    def session_peaks(self) -> dict[str, float]:
+        """Return the peak amplitude per source over the whole recording session."""
+
+        with self._level_lock:
+            snapshot = dict(self._session_peaks)
+        if self._loopback is not None:
+            snapshot["system"] = max(snapshot.get("system", 0.0), self._loopback.session_peak())
         return snapshot
 
     def elapsed_seconds(self) -> float:
@@ -325,6 +337,10 @@ class MeetingAudioRecorder:
         if self._loopback is not None:
             raw_path, _mono_path = self._loopback.stop()
             self._system_raw_path = raw_path
+            loopback_peak = self._loopback.session_peak()
+            with self._level_lock:
+                if loopback_peak > self._session_peaks.get("system", 0.0):
+                    self._session_peaks["system"] = loopback_peak
             self._loopback = None
         for writer in self._writers:
             writer.stop()
@@ -481,6 +497,8 @@ class MeetingAudioRecorder:
         with self._level_lock:
             if peak > self._levels.get(label, 0.0):
                 self._levels[label] = peak
+            if peak > self._session_peaks.get(label, 0.0):
+                self._session_peaks[label] = peak
 
     def _close_streams(self) -> None:
         while self._streams:

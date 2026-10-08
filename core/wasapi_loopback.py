@@ -146,6 +146,7 @@ class WasapiLoopbackRecorder:
         self._started_at: float | None = None
         self._level_lock = threading.Lock()
         self._level = 0.0
+        self._session_peak = 0.0
         self._audio_errors: tuple[type[BaseException], ...] = (OSError, RuntimeError, ValueError)
 
     @staticmethod
@@ -242,6 +243,8 @@ class WasapiLoopbackRecorder:
                 with self._level_lock:
                     if peak > self._level:
                         self._level = peak
+                    if peak > self._session_peak:
+                        self._session_peak = peak
 
     def levels(self) -> float:
         """Return the peak amplitude since the last call, then reset it."""
@@ -250,6 +253,12 @@ class WasapiLoopbackRecorder:
             value = self._level
             self._level = 0.0
         return value
+
+    def session_peak(self) -> float:
+        """Return the highest amplitude seen since the recording started."""
+
+        with self._level_lock:
+            return self._session_peak
 
     def elapsed_seconds(self) -> float:
         """Return how long the recording has been running."""

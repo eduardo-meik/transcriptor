@@ -4,10 +4,12 @@ torchaudio
 ffmpeg-python
 sounddevice
 soundfile
+pyaudiowpatch
 numpy
 scipy
 faster-whisper
 whisperx
+requests
 python-dotenv
 anthropic
 google-genai

@@ -57,18 +57,31 @@ class FasterWhisperTranscriber:
         output_dir.mkdir(parents=True, exist_ok=True)
         model = self._load_model()
 
+        transcribe_kwargs: dict[str, Any] = {
+            "language": self.config.language,
+            "task": "transcribe",
+            "vad_filter": True,
+        }
+        if self.config.initial_prompt:
+            transcribe_kwargs["initial_prompt"] = self.config.initial_prompt
+
         try:
-            transcribe_kwargs: dict[str, Any] = {
-                "language": self.config.language,
-                "task": "transcribe",
-                "vad_filter": True,
-            }
-            if self.config.initial_prompt:
-                transcribe_kwargs["initial_prompt"] = self.config.initial_prompt
             segments, info = model.transcribe(str(audio_path), **transcribe_kwargs)
             collected_segments = list(segments)
         except (RuntimeError, ValueError, OSError) as exc:
-            raise TranscriptionError(f"Transcription failed: {exc}") from exc
+            # CUDA libraries (for example cublas64_12.dll) can fail lazily on the
+            # first real inference rather than when the model is constructed, so
+            # the CPU fallback has to be applied here as well.
+            if not self.config.allow_cpu_fallback or self.config.device == "cpu":
+                raise TranscriptionError(f"Transcription failed: {exc}") from exc
+            print(f"CUDA transcription failed: {exc}")
+            print("Retrying on CPU with int8 compute.")
+            model = WhisperModel(self.config.model_size, device="cpu", compute_type="int8")
+            try:
+                segments, info = model.transcribe(str(audio_path), **transcribe_kwargs)
+                collected_segments = list(segments)
+            except (RuntimeError, ValueError, OSError) as retry_exc:
+                raise TranscriptionError(f"Transcription failed on CPU as well: {retry_exc}") from retry_exc
 
         text = "\n".join(_get_segment_text(segment) for segment in collected_segments if _get_segment_text(segment))
         text_path = output_dir / "transcript_raw.txt"

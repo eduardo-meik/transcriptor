@@ -74,7 +74,7 @@ def _run_recording_status(
     sys.stdout.flush()
 
 
-def _report_capture_quality(recorder: MeetingAudioRecorder, system_only: bool) -> None:
+def report_capture_quality(recorder: MeetingAudioRecorder, system_only: bool) -> None:
     """Report the recorded signal level and warn when a channel captured nothing.
 
     A silent channel is otherwise invisible: the WAV is still produced and the
@@ -256,7 +256,7 @@ def main() -> int:
 
         recording = recorder.stop()
         print(f"Saved mixed audio: {recording.mixed_wav}")
-        _report_capture_quality(recorder, args.system_only)
+        report_capture_quality(recorder, args.system_only)
 
         transcriber = FasterWhisperTranscriber(transcriber_config)
         if transcriber_config.use_whisperx or transcriber_config.diarize:

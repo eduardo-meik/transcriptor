@@ -346,7 +346,7 @@ class MeetingAudioRecorder:
             writer.stop()
 
         mixed_path = self.output_dir / "meeting_audio.wav"
-        self._mix_to_target_wav(mixed_path)
+        self.mix_to_target_wav(mixed_path)
         self._started_at = None
 
         return RecordingResult(
@@ -482,11 +482,11 @@ class MeetingAudioRecorder:
             if status:
                 print(f"Audio warning ({label}): {status}")
             writer.write(indata)
-            self._record_level(label, indata)
+            self.record_level(label, indata)
 
         return callback  # type: ignore[return-value]
 
-    def _record_level(self, label: str, indata: np.ndarray) -> None:
+    def record_level(self, label: str, indata: np.ndarray) -> None:
         """Track the peak amplitude seen for a source since the last ``levels()`` call."""
 
         array = np.asarray(indata, dtype=np.float32)
@@ -511,9 +511,12 @@ class MeetingAudioRecorder:
             writer = self._writers.pop()
             writer.stop()
 
-    def _mix_to_target_wav(self, output_path: Path) -> None:
-        system_audio = self._load_resampled_mono(self._system_raw_path)
-        microphone_audio = self._load_resampled_mono(self._microphone_raw_path)
+    def mix_to_target_wav(self, output_path: Path) -> None:
+        """Mix both raw sources into a resampled mono WAV at the target rate."""
+        system_path = self._system_raw_path or self.output_dir / "system_raw.wav"
+        microphone_path = self._microphone_raw_path or self.output_dir / "microphone_raw.wav"
+        system_audio = self._load_resampled_mono(system_path)
+        microphone_audio = self._load_resampled_mono(microphone_path)
         max_length = max(len(system_audio), len(microphone_audio))
         if max_length == 0:
             raise AudioRecorderError("No audio samples were captured.")

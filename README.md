@@ -17,7 +17,9 @@ Run the meeting assistant with a desktop window:
 python main.py --gui
 ```
 
-The window lets you choose the WASAPI output and microphone, start and stop recording, and monitor each source's live audio level and meeting duration. It reports when a source is silent or unusually quiet. Transcription and the optional summary/analysis start after recording stops; transcription is not live. The summary checkbox is enabled by default and uses the provider configured in `.env`.
+The window lets you choose the WASAPI output and microphone, start and stop recording, and monitor each source's live audio level and meeting duration. It reports when a source is silent or unusually quiet. The interface uses a light palette and Segoe UI. Transcription and the optional summary/analysis start after recording stops; transcription is not live. The summary checkbox is enabled by default and uses the provider configured in `.env`.
+
+The **Reuniones** tab lists completed meetings with a locally derived title, date, and recorded audio duration. Select a meeting to preview its `transcript_raw.md` file and copy its contents; use **Abrir archivo MD** to open it externally. **Ver resumen** opens `meeting_report.md` when one was generated. Titles are taken from the transcript locally, without another AI request. Use **Actualizar** to refresh the list.
 
 On Windows, a desktop shortcut can launch the window directly. It should target the environment's `pythonw.exe`, use `main.py --gui` as its arguments, and set this project directory as its working directory.
 

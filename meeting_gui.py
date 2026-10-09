@@ -6,8 +6,10 @@ import logging
 import math
 import os
 import queue
+import re
 import threading
 import tkinter as tk
+import wave
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -56,6 +58,15 @@ class OperationFailed:
     message: str
 
 
+@dataclass(frozen=True)
+class MeetingEntry:
+    title: str
+    meeting_date: datetime
+    duration_seconds: float | None
+    transcript_path: Path
+    summary_path: Path | None
+
+
 GuiMessage: TypeAlias = RecordingStarted | CaptureSaved | ProcessingPhase | MeetingComplete | OperationFailed
 
 
@@ -78,6 +89,96 @@ def _device_label(index: int, name: str) -> str:
     return f"{' '.join(name.split())}  [{index}]"
 
 
+def list_meetings(output_root: Path) -> list[MeetingEntry]:
+    """Find completed meetings and derive their duration from the saved WAV."""
+
+    if not output_root.exists():
+        return []
+
+    entries: list[MeetingEntry] = []
+    for meeting_dir in output_root.iterdir():
+        if not meeting_dir.is_dir():
+            continue
+        transcript_path = meeting_dir / "transcript_raw.md"
+        if not transcript_path.is_file():
+            continue
+
+        try:
+            title = derive_meeting_title(transcript_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError) as exc:
+            logger.warning("Could not read meeting transcript %s to derive its title: %s", transcript_path, exc)
+            title = meeting_dir.name
+
+        try:
+            meeting_date = datetime.strptime(meeting_dir.name, "%Y%m%d_%H%M%S")
+        except ValueError:
+            meeting_date = datetime.fromtimestamp(meeting_dir.stat().st_mtime)
+
+        audio_path = meeting_dir / "meeting_audio.wav"
+        duration_seconds: float | None = None
+        if audio_path.is_file():
+            try:
+                with wave.open(str(audio_path), "rb") as audio_file:
+                    frame_rate = audio_file.getframerate()
+                    if frame_rate > 0:
+                        duration_seconds = audio_file.getnframes() / frame_rate
+                    else:
+                        logger.warning("Could not determine meeting duration from %s: invalid sample rate", audio_path)
+            except (OSError, wave.Error) as exc:
+                logger.warning("Could not read meeting audio duration from %s: %s", audio_path, exc)
+
+        summary_path = meeting_dir / "meeting_report.md"
+        entries.append(
+            MeetingEntry(
+                title=title,
+                meeting_date=meeting_date,
+                duration_seconds=duration_seconds,
+                transcript_path=transcript_path,
+                summary_path=summary_path if summary_path.is_file() else None,
+            )
+        )
+
+    return sorted(entries, key=lambda entry: entry.meeting_date, reverse=True)
+
+
+def derive_meeting_title(markdown: str, max_length: int = 72) -> str:
+    """Create a short local title from the first substantial transcript sentence."""
+
+    transcript = markdown.split("---", maxsplit=1)[-1]
+    fallback = "Reunión sin título"
+    for line in transcript.splitlines():
+        candidate = line.strip()
+        if not candidate or candidate.startswith("#") or candidate.startswith("**"):
+            continue
+        candidate = re.sub(r"[*_`>#]", "", candidate)
+        candidate = re.sub(r"^(?:(?:ya|sí|si|eh|mmm|mm|bueno)[,.\s]+)+", "", candidate, flags=re.IGNORECASE)
+        if not candidate:
+            continue
+        fallback = candidate
+        for sentence in re.split(r"(?<=[.!?])\s+", candidate):
+            words = re.findall(r"[^\W_]+", sentence, flags=re.UNICODE)
+            if len(words) >= 4:
+                candidate = sentence.strip(" \t\"'“”")
+                break
+        else:
+            words = candidate.split()
+            if len(words) < 4:
+                continue
+            candidate = " ".join(words[:10]).strip(" \t\"'“”")
+
+        candidate = candidate.rstrip(" .!?")
+        if len(candidate) > max_length:
+            candidate = candidate[: max_length - 1].rsplit(" ", 1)[0].rstrip(" ,;:-") + "…"
+        return candidate[:1].upper() + candidate[1:]
+    return fallback[:max_length]
+
+
+def format_meeting_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "—"
+    return format_elapsed(seconds)
+
+
 class MeetingControlApp:
     """Tkinter UI that runs recording and post-processing off the UI thread."""
 
@@ -91,44 +192,93 @@ class MeetingControlApp:
         self._close_after_processing = False
         self._loopback_devices: dict[str, int] = {}
         self._microphone_devices: dict[str, int] = {}
+        self._meeting_entries: dict[str, MeetingEntry] = {}
+        self._selected_transcript_text = ""
         self._selected_system_label = ""
         self._session_summary_enabled = True
         self._summary_enabled = tk.BooleanVar(value=True)
 
         self.root.title("Meik Labs | Asistente de reuniones")
+        self.root.iconbitmap(str(Path(__file__).resolve().with_name("icon.ico")))
         self.root.geometry("900x720")
         self.root.minsize(760, 660)
-        self.root.configure(background="#10151f")
+        self.root.configure(background="#f4f6f8")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._configure_styles()
         self._build_interface()
+        self._refresh_meetings()
         self._refresh_devices()
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
         self.root.after(120, self._poll_messages)
         self.root.after(250, self._update_live_status)
 
     def _configure_styles(self) -> None:
         style = ttk.Style(self.root)
         style.theme_use("clam")
-        style.configure("App.TFrame", background="#10151f")
-        style.configure("Card.TFrame", background="#192231")
-        style.configure("TLabel", background="#10151f", foreground="#e7edf7", font=("Segoe UI", 10))
-        style.configure("Card.TLabel", background="#192231", foreground="#e7edf7", font=("Segoe UI", 10))
-        style.configure("Muted.Card.TLabel", background="#192231", foreground="#9ba9bd", font=("Segoe UI", 9))
-        style.configure("Title.Card.TLabel", background="#192231", foreground="#f5f7fb", font=("Segoe UI", 12, "bold"))
-        style.configure("Timer.TLabel", background="#192231", foreground="#f5f7fb", font=("Segoe UI", 32, "bold"))
-        style.configure("Status.TLabel", background="#192231", foreground="#73d6a3", font=("Segoe UI", 10, "bold"))
-        style.configure("Warning.TLabel", background="#192231", foreground="#f4bd63", font=("Segoe UI", 10, "bold"))
-        style.configure("TCombobox", fieldbackground="#222d3e", background="#222d3e", foreground="#e7edf7")
-        style.configure("TCheckbutton", background="#192231", foreground="#e7edf7")
-        style.map("TCheckbutton", background=[("active", "#192231")])
-        style.configure("System.Horizontal.TProgressbar", troughcolor="#263447", background="#54a9ff")
-        style.configure("Microphone.Horizontal.TProgressbar", troughcolor="#263447", background="#50d19a")
+        style.configure("App.TFrame", background="#f4f6f8")
+        style.configure("Card.TFrame", background="#ffffff")
+        style.configure("TLabel", background="#f4f6f8", foreground="#344054", font=("Segoe UI", 10))
+        style.configure("Card.TLabel", background="#ffffff", foreground="#344054", font=("Segoe UI", 10))
+        style.configure("Muted.Card.TLabel", background="#ffffff", foreground="#667085", font=("Segoe UI", 9))
+        style.configure("Title.Card.TLabel", background="#ffffff", foreground="#101828", font=("Segoe UI", 12, "bold"))
+        style.configure("Timer.TLabel", background="#ffffff", foreground="#101828", font=("Segoe UI", 32, "bold"))
+        style.configure("Status.TLabel", background="#ffffff", foreground="#067647", font=("Segoe UI", 10, "bold"))
+        style.configure("Warning.TLabel", background="#ffffff", foreground="#b54708", font=("Segoe UI", 10, "bold"))
+        style.configure("TCombobox", fieldbackground="#ffffff", background="#ffffff", foreground="#344054")
+        style.configure("TCheckbutton", background="#ffffff", foreground="#344054")
+        style.map("TCheckbutton", background=[("active", "#ffffff")])
+        style.configure("TButton", background="#ffffff", foreground="#344054", padding=(10, 6))
+        style.map(
+            "TButton",
+            background=[("active", "#f2f4f7"), ("disabled", "#f9fafb")],
+            foreground=[("disabled", "#98a2b3")],
+        )
+        style.configure("TNotebook", background="#f4f6f8", borderwidth=0)
+        style.configure(
+            "TNotebook.Tab",
+            background="#e4e7ec",
+            foreground="#344054",
+            padding=(14, 8),
+            font=("Segoe UI", 10, "bold"),
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", "#ffffff"), ("active", "#eaecf0")],
+            foreground=[("selected", "#101828")],
+        )
+        style.configure(
+            "Treeview",
+            background="#ffffff",
+            fieldbackground="#ffffff",
+            foreground="#344054",
+            rowheight=28,
+            borderwidth=0,
+            font=("Segoe UI", 10),
+        )
+        style.map("Treeview", background=[("selected", "#d1e9ff")], foreground=[("selected", "#1849a9")])
+        style.configure(
+            "Treeview.Heading",
+            background="#f2f4f7",
+            foreground="#344054",
+            font=("Segoe UI", 9, "bold"),
+            relief="flat",
+        )
+        style.map("Treeview.Heading", background=[("active", "#eaecf0")])
+        style.configure("System.Horizontal.TProgressbar", troughcolor="#e4e7ec", background="#1570ef")
+        style.configure("Microphone.Horizontal.TProgressbar", troughcolor="#e4e7ec", background="#12b76a")
         style.configure("Start.TButton", font=("Segoe UI", 11, "bold"), padding=(18, 12))
         style.configure("Stop.TButton", font=("Segoe UI", 11, "bold"), padding=(18, 12))
         style.configure("Refresh.TButton", padding=(10, 5))
 
     def _build_interface(self) -> None:
-        container = ttk.Frame(self.root, style="App.TFrame", padding=(24, 20))
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True)
+        capture_tab = ttk.Frame(self.notebook, style="App.TFrame")
+        meetings_tab = ttk.Frame(self.notebook, style="App.TFrame")
+        self.notebook.add(capture_tab, text="Captura")
+        self.notebook.add(meetings_tab, text="Reuniones")
+
+        container = ttk.Frame(capture_tab, style="App.TFrame", padding=(24, 20))
         container.pack(fill="both", expand=True)
 
         header = ttk.Frame(container, style="App.TFrame")
@@ -137,12 +287,12 @@ class MeetingControlApp:
             header,
             text="ASISTENTE DE REUNIONES",
             font=("Segoe UI", 18, "bold"),
-            foreground="#f5f7fb",
+            foreground="#101828",
         ).pack(anchor="w")
         ttk.Label(
             header,
             text="Control local de captura y procesamiento. Revisa los medidores antes de empezar.",
-            foreground="#9ba9bd",
+            foreground="#667085",
         ).pack(anchor="w", pady=(4, 0))
 
         devices_card = self._card(container)
@@ -207,14 +357,281 @@ class MeetingControlApp:
         )
         self.open_folder_button.pack(side="right")
 
-        self.message_label = ttk.Label(container, text="", wraplength=830, justify="left", foreground="#f4bd63")
+        self.message_label = ttk.Label(container, text="", wraplength=830, justify="left", foreground="#b54708")
         self.message_label.pack(fill="x", pady=(0, 8))
         ttk.Label(
             container,
             text="La transcripcion se procesa localmente. El resumen, si esta activado, envia el texto al proveedor configurado.",
-            foreground="#8290a4",
+            foreground="#667085",
             wraplength=830,
         ).pack(anchor="w", side="bottom", pady=(8, 0))
+
+        self._build_meetings_interface(meetings_tab)
+
+    def _build_meetings_interface(self, parent: ttk.Frame) -> None:
+        container = ttk.Frame(parent, style="App.TFrame", padding=(24, 20))
+        container.pack(fill="both", expand=True)
+        header = ttk.Frame(container, style="App.TFrame")
+        header.pack(fill="x", pady=(0, 18))
+        ttk.Label(
+            header,
+            text="REUNIONES",
+            font=("Segoe UI", 18, "bold"),
+            foreground="#101828",
+        ).pack(side="left")
+        ttk.Button(
+            header,
+            text="Actualizar",
+            style="Refresh.TButton",
+            command=self._refresh_meetings,
+        ).pack(side="right")
+
+        card = self._card(container)
+        card.pack(fill="both", expand=True)
+        ttk.Label(
+            card,
+            text="Selecciona una reunión para previsualizar su transcripción. El título se extrae localmente del texto.",
+            style="Muted.Card.TLabel",
+        ).pack(anchor="w", padx=16, pady=(14, 10))
+
+        table_frame = ttk.Frame(card, style="Card.TFrame")
+        table_frame.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        columns = ("title", "date", "duration", "transcript", "summary")
+        self.meetings_table = ttk.Treeview(table_frame, columns=columns, show="headings", height=8)
+        self.meetings_table.heading("title", text="Reunión")
+        self.meetings_table.heading("date", text="Fecha")
+        self.meetings_table.heading("duration", text="Duración")
+        self.meetings_table.heading("transcript", text="Archivo")
+        self.meetings_table.heading("summary", text="Resumen")
+        self.meetings_table.column("title", width=280, anchor="w")
+        self.meetings_table.column("date", width=140, anchor="w")
+        self.meetings_table.column("duration", width=90, anchor="center")
+        self.meetings_table.column("transcript", width=100, anchor="center")
+        self.meetings_table.column("summary", width=100, anchor="center")
+        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.meetings_table.yview)
+        self.meetings_table.configure(yscrollcommand=scrollbar.set)
+        self.meetings_table.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self.meetings_table.bind("<<TreeviewSelect>>", self._on_meeting_selected)
+        self.meetings_table.bind("<ButtonRelease-1>", self._on_meeting_table_click)
+        self.meetings_table.bind("<Double-1>", self._on_meeting_table_double_click)
+
+        preview_card = self._card(container)
+        preview_card.pack(fill="both", expand=True, pady=(8, 0))
+        preview_header = ttk.Frame(preview_card, style="Card.TFrame")
+        preview_header.pack(fill="x", padx=16, pady=(12, 8))
+        self.preview_title_label = ttk.Label(
+            preview_header,
+            text="Previsualización de la transcripción",
+            style="Title.Card.TLabel",
+        )
+        self.preview_title_label.pack(side="left")
+        self.copy_transcript_button = ttk.Button(
+            preview_header,
+            text="Copiar",
+            command=self._copy_selected_transcript,
+            state="disabled",
+        )
+        self.copy_transcript_button.pack(side="right")
+        preview_frame = ttk.Frame(preview_card, style="Card.TFrame")
+        preview_frame.pack(fill="both", expand=True, padx=16, pady=(0, 14))
+        self.transcript_preview = tk.Text(
+            preview_frame,
+            wrap="word",
+            height=8,
+            state="disabled",
+            background="#ffffff",
+            foreground="#344054",
+            insertbackground="#344054",
+            relief="flat",
+            padx=12,
+            pady=10,
+            font=("Segoe UI", 10),
+        )
+        self.transcript_preview.tag_configure("h1", font=("Segoe UI", 16, "bold"), foreground="#101828")
+        self.transcript_preview.tag_configure("h2", font=("Segoe UI", 13, "bold"), foreground="#101828")
+        self.transcript_preview.tag_configure("h3", font=("Segoe UI", 11, "bold"), foreground="#101828")
+        self.transcript_preview.tag_configure("bold", font=("Segoe UI", 10, "bold"))
+        self.transcript_preview.tag_configure("italic", font=("Segoe UI", 10, "italic"))
+        self.transcript_preview.tag_configure("code", font=("Consolas", 10), foreground="#175cd3")
+        self.transcript_preview.tag_configure("muted", foreground="#667085")
+        self.transcript_preview.tag_configure("bullet", foreground="#067647")
+        preview_scrollbar = ttk.Scrollbar(preview_frame, orient="vertical", command=self.transcript_preview.yview)
+        self.transcript_preview.configure(yscrollcommand=preview_scrollbar.set)
+        self.transcript_preview.pack(side="left", fill="both", expand=True)
+        preview_scrollbar.pack(side="right", fill="y")
+
+        footer = ttk.Frame(container, style="App.TFrame")
+        footer.pack(fill="x", pady=(12, 0))
+        self.meetings_count_label = ttk.Label(footer, text="0 reuniones", foreground="#667085")
+        self.meetings_count_label.pack(side="left")
+        self.open_transcript_button = ttk.Button(
+            footer,
+            text="Abrir archivo MD",
+            command=self._open_selected_transcript,
+            state="disabled",
+        )
+        self.open_transcript_button.pack(side="right")
+        self.open_summary_button = ttk.Button(
+            footer,
+            text="Ver resumen",
+            command=self._open_selected_summary,
+            state="disabled",
+        )
+        self.open_summary_button.pack(side="right", padx=(0, 8))
+
+    def _refresh_meetings(self) -> None:
+        entries = list_meetings(self.config.output_root)
+        for item in self.meetings_table.get_children():
+            self.meetings_table.delete(item)
+        self._meeting_entries.clear()
+        for index, entry in enumerate(entries):
+            item_id = str(index)
+            self._meeting_entries[item_id] = entry
+            self.meetings_table.insert(
+                "",
+                "end",
+                iid=item_id,
+                values=(
+                    entry.title,
+                    entry.meeting_date.strftime("%d/%m/%Y %H:%M"),
+                    format_meeting_duration(entry.duration_seconds),
+                    "Ver",
+                    "Ver" if entry.summary_path is not None else "—",
+                ),
+            )
+        count = len(entries)
+        noun = "reunión" if count == 1 else "reuniones"
+        self.meetings_count_label.configure(text=f"{count} {noun}")
+        self.open_transcript_button.configure(state="disabled")
+        self.open_summary_button.configure(state="disabled")
+        self.copy_transcript_button.configure(state="disabled")
+        self.preview_title_label.configure(text="Previsualización de la transcripción")
+        self._set_transcript_preview("")
+
+    def _on_tab_changed(self, _event: tk.Event[tk.Misc]) -> None:
+        self._refresh_meetings()
+
+    def _on_meeting_selected(self, _event: tk.Event[tk.Misc]) -> None:
+        selection = self.meetings_table.selection()
+        entry = self._meeting_entries.get(selection[0]) if selection else None
+        if entry is None:
+            self._selected_transcript_text = ""
+            self._set_transcript_preview("")
+            self.open_transcript_button.configure(state="disabled")
+            self.open_summary_button.configure(state="disabled")
+            self.copy_transcript_button.configure(state="disabled")
+            return
+        try:
+            self._selected_transcript_text = entry.transcript_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            self._selected_transcript_text = ""
+            logger.exception("Could not load meeting transcript %s", entry.transcript_path)
+            self._set_transcript_preview(f"No se pudo cargar la transcripción:\n{exc}")
+            self.copy_transcript_button.configure(state="disabled")
+        else:
+            self._set_transcript_preview(self._selected_transcript_text)
+            self.copy_transcript_button.configure(state="normal")
+        self.preview_title_label.configure(text=entry.title)
+        self.open_transcript_button.configure(state="normal")
+        self.open_summary_button.configure(state="normal" if entry.summary_path is not None else "disabled")
+
+    def _set_transcript_preview(self, content: str) -> None:
+        self.transcript_preview.configure(state="normal")
+        self.transcript_preview.delete("1.0", "end")
+        for line in content.splitlines():
+            heading = re.match(r"^(#{1,6})\s+(.*)$", line)
+            if heading:
+                tag = "h1" if len(heading.group(1)) == 1 else "h2" if len(heading.group(1)) == 2 else "h3"
+                self._insert_markdown_inline(heading.group(2), (tag,))
+            elif re.match(r"^\s*(?:---+|\*\*\*+|___+)\s*$", line):
+                self.transcript_preview.insert("end", "────────────────────────────\n", ("muted",))
+                continue
+            else:
+                bullet = re.match(r"^(\s*)([-*+]|\d+\.)\s+(.*)$", line)
+                if bullet:
+                    self.transcript_preview.insert("end", f"{bullet.group(1)}{bullet.group(2)} ", ("bullet",))
+                    self._insert_markdown_inline(bullet.group(3))
+                else:
+                    quote = re.match(r"^\s*>\s?(.*)$", line)
+                    if quote:
+                        self.transcript_preview.insert("end", "│ ", ("muted",))
+                        self._insert_markdown_inline(quote.group(1), ("muted",))
+                    else:
+                        self._insert_markdown_inline(line)
+            self.transcript_preview.insert("end", "\n")
+        self.transcript_preview.configure(state="disabled")
+
+    def _insert_markdown_inline(self, text: str, base_tags: tuple[str, ...] = ()) -> None:
+        pattern = re.compile(r"(\*\*.+?\*\*|__.+?__|`[^`]+`|\*[^*]+\*|_[^_]+_)")
+        offset = 0
+        for match in pattern.finditer(text):
+            if match.start() > offset:
+                self.transcript_preview.insert("end", text[offset : match.start()], base_tags)
+            token = match.group()
+            if token.startswith(("**", "__")):
+                rendered, tags = token[2:-2], (*base_tags, "bold")
+            elif token.startswith("`"):
+                rendered, tags = token[1:-1], (*base_tags, "code")
+            else:
+                rendered, tags = token[1:-1], (*base_tags, "italic")
+            self.transcript_preview.insert("end", rendered, tags)
+            offset = match.end()
+        if offset < len(text):
+            self.transcript_preview.insert("end", text[offset:], base_tags)
+
+    def _on_meeting_table_click(self, event: tk.Event[tk.Misc]) -> None:
+        item_id = self.meetings_table.identify_row(event.y)
+        if item_id:
+            self.meetings_table.selection_set(item_id)
+            column = self.meetings_table.identify_column(event.x)
+            if column == "#4":
+                self._open_selected_transcript()
+            elif column == "#5":
+                self._open_selected_summary()
+
+    def _on_meeting_table_double_click(self, _event: tk.Event[tk.Misc]) -> None:
+        self._on_meeting_selected(_event)
+
+    def _open_selected_transcript(self) -> None:
+        selection = self.meetings_table.selection()
+        if not selection:
+            return
+        entry = self._meeting_entries.get(selection[0])
+        if entry is None or not entry.transcript_path.is_file():
+            messagebox.showerror("Archivo no encontrado", "La transcripción seleccionada ya no existe.", parent=self.root)
+            self._refresh_meetings()
+            return
+        try:
+            os.startfile(entry.transcript_path)  # type: ignore[attr-defined]
+        except OSError as exc:
+            logger.exception("Could not open meeting transcript %s", entry.transcript_path)
+            messagebox.showerror("No se pudo abrir el archivo", str(exc), parent=self.root)
+
+    def _open_selected_summary(self) -> None:
+        selection = self.meetings_table.selection()
+        if not selection:
+            return
+        entry = self._meeting_entries.get(selection[0])
+        if entry is None or entry.summary_path is None or not entry.summary_path.is_file():
+            messagebox.showerror("Resumen no disponible", "Esta reunión no tiene un archivo de resumen.", parent=self.root)
+            self._refresh_meetings()
+            return
+        try:
+            os.startfile(entry.summary_path)  # type: ignore[attr-defined]
+        except OSError as exc:
+            logger.exception("Could not open meeting summary %s", entry.summary_path)
+            messagebox.showerror("No se pudo abrir el resumen", str(exc), parent=self.root)
+
+    def _copy_selected_transcript(self) -> None:
+        selection = self.meetings_table.selection()
+        if not selection or not self._selected_transcript_text:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self._selected_transcript_text)
+        entry = self._meeting_entries.get(selection[0])
+        if entry is not None:
+            self.preview_title_label.configure(text=f"{entry.title} — copiada")
 
     @staticmethod
     def _card(parent: tk.Widget) -> ttk.Frame:
@@ -442,6 +859,7 @@ class MeetingControlApp:
                     details.append(f"Analisis: {message.analysis}")
                 self.message_label.configure(text="\n".join(details))
                 self._output_dir = message.output_dir
+                self._refresh_meetings()
                 self.open_folder_button.configure(state="normal")
                 self.start_button.configure(state="normal")
                 self.stop_button.configure(state="disabled")

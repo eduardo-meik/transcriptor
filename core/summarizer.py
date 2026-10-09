@@ -21,9 +21,10 @@ class _Provider(Protocol):
 
 @dataclass(frozen=True)
 class SummaryConfig:
-    provider: str = "anthropic"
+    provider: str = "openrouter"
     anthropic_model: str = "claude-3-5-sonnet-latest"
     google_model: str = "gemini-1.5-pro"
+    openrouter_model: str = "nvidia/nemotron-3-ultra-550b-a55b"
     lmstudio_base_url: str = "http://localhost:1234/v1"
     lmstudio_model: str = "local-model"
     cleanup_pass: bool = False
@@ -87,6 +88,8 @@ class MeetingSummarizer:
 
     def _create_provider(self) -> _Provider:
         provider = self.config.provider.lower().strip()
+        if provider == "openrouter":
+            return _OpenRouterProvider(self.config.openrouter_model)
         if provider == "anthropic":
             return _AnthropicProvider(self.config.anthropic_model)
         if provider == "google":
@@ -97,6 +100,83 @@ class MeetingSummarizer:
                 model=self.config.lmstudio_model,
             )
         raise SummaryError(f"Unsupported summary provider: {self.config.provider}")
+
+
+class _OpenRouterProvider:
+    def __init__(self, model: str) -> None:
+        self.model = model
+
+    def summarize(self, transcript: str, task: str = "summary", meeting_type: str = "technical", **_: Any) -> str:
+        chunks = _split_transcript(transcript, max_characters=4_000)
+        if len(chunks) > 1:
+            transcript = "\n\n".join(
+                self._chat(
+                    _SYSTEM_PROMPT,
+                    "Extrae solo hechos, decisiones, tareas, responsables y riesgos del siguiente fragmento:\n\n" + chunk,
+                    temperature=0.1,
+                    max_tokens=600,
+                )
+                for chunk in chunks
+            )
+        return self._chat(
+            _SYSTEM_PROMPT,
+            _build_user_prompt(transcript, task=task, meeting_type=meeting_type),
+            temperature=0.2,
+            max_tokens=1500,
+        )
+
+    def cleanup(self, transcript: str) -> str:
+        return "\n\n".join(
+            self._chat(
+                "Corrige solo la transcripción. Mantén el contenido original. Corrige puntuación, "
+                "mayúsculas, fillers y términos técnicos. No inventes hechos ni decisiones. "
+                "Devuelve solo el texto corregido. La reunión puede tratar de acuicultura, ingeniería "
+                "naval o desarrollo de software; usa ese contexto y el glosario técnico para resolver "
+                "ambigüedades.",
+                chunk,
+                temperature=0.1,
+                max_tokens=1000,
+            )
+            for chunk in _split_transcript(transcript)
+        )
+
+    def _chat(self, system_prompt: str, user_prompt: str, temperature: float, max_tokens: int) -> str:
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            raise SummaryError("OPENROUTER_API_KEY is not configured.")
+
+        payload: dict[str, str | float | int | list[dict[str, str]]] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        try:
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=600,
+            )
+        except requests.RequestException as exc:
+            raise SummaryError(f"OpenRouter request failed: {exc}") from exc
+        if response.status_code >= 400:
+            raise SummaryError(f"OpenRouter request failed: {response.status_code} - {response.text[:400]}")
+
+        try:
+            body = response.json()
+            content = body["choices"][0]["message"]["content"]
+            if not isinstance(content, str) or not content.strip():
+                raise SummaryError("OpenRouter returned an empty summary.")
+            return content.strip()
+        except (ValueError, KeyError, TypeError, IndexError) as exc:
+            raise SummaryError("OpenRouter returned an unexpected response.") from exc
 
 
 class _AnthropicProvider:

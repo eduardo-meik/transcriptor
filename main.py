@@ -11,16 +11,12 @@ import time
 from datetime import datetime
 
 from core.audio_recorder import AudioDeviceSelection, AudioRecorderError, MeetingAudioRecorder
+from core.capture_quality import capture_warnings
 from core.config import load_config
 from core.summarizer import MeetingSummarizer, SummaryConfig, SummaryError
 from core.transcriber import FasterWhisperTranscriber, TranscriptionConfig, TranscriptionError
 
 SPINNER = "|/-\\"
-
-# Peak-amplitude thresholds used to warn about a channel that captured nothing.
-SILENCE_PEAK = 0.0005  # -66 dBFS
-VERY_LOW_PEAK = 0.01  # -40 dBFS
-
 
 def _db(level: float) -> str:
     """Return a short dBFS label for a linear amplitude."""
@@ -86,23 +82,7 @@ def report_capture_quality(recorder: MeetingAudioRecorder, system_only: bool) ->
     system_peak = peaks.get("system", 0.0)
     microphone_peak = peaks.get("microphone", 0.0)
 
-    warnings: list[str] = []
-    if system_peak < SILENCE_PEAK:
-        warnings.append(
-            "El canal de SISTEMA no capturo audio. Causas probables: nadie mas hablo durante "
-            "la grabacion, o Teams cambio de dispositivo de salida."
-        )
-    elif system_peak < VERY_LOW_PEAK:
-        warnings.append("El canal de SISTEMA capturo muy bajo. Revisa el volumen de salida.")
-
-    if not system_only:
-        if microphone_peak < SILENCE_PEAK:
-            warnings.append(
-                "El canal de MICROFONO no capturo audio. Revisa el dispositivo de entrada con "
-                "`python main.py --check-devices`."
-            )
-        elif microphone_peak < VERY_LOW_PEAK:
-            warnings.append("El canal de MICROFONO capturo muy bajo. Revisa el nivel de entrada.")
+    warnings = capture_warnings(peaks, system_only)
 
     print(f"Niveles grabados: sistema {_db_label(system_peak)} | microfono {_db_label(microphone_peak)}")
     if not warnings:
@@ -152,7 +132,7 @@ def parse_args() -> argparse.Namespace:
         help="Microphone name substring. Defaults to the microphone of the captured headset.",
     )
     parser.add_argument("--no-summary", action="store_true", help="Skip external AI summarization.")
-    parser.add_argument("--provider", choices=["anthropic", "google", "lmstudio"], help="Summary provider.")
+    parser.add_argument("--provider", choices=["openrouter", "anthropic", "google", "lmstudio"], help="Summary provider.")
     parser.add_argument("--model", help="faster-whisper model size, e.g. large-v3, medium, small.")
     parser.add_argument("--prompt", help="Optional technical glossary/context to bias Whisper transcription.")
     parser.add_argument("--whisperx", action="store_true", help="Use WhisperX and optional diarization for multi-speaker meetings.")
@@ -173,6 +153,7 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Auto-start and stop recording after N seconds (0 = manual Enter control).",
     )
+    parser.add_argument("--gui", action="store_true", help="Open the desktop meeting-control window.")
     return parser.parse_args()
 
 
@@ -222,6 +203,11 @@ def main() -> int:
         except AudioRecorderError as exc:
             print(f"Error: {exc}")
             return 1
+
+    if args.gui:
+        from meeting_gui import run_gui
+
+        return run_gui(config)
 
     transcriber_config = TranscriptionConfig(
         model_size=args.model or config.whisper_model,
@@ -273,6 +259,7 @@ def main() -> int:
                     provider=args.provider or config.summary_provider,
                     anthropic_model=config.anthropic_model,
                     google_model=config.google_model,
+                    openrouter_model=config.openrouter_model,
                     lmstudio_base_url=args.lmstudio_url,
                     lmstudio_model=args.lmstudio_model,
                     cleanup_pass=args.cleanup,

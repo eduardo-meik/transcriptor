@@ -57,6 +57,51 @@ class MeetingGuiTests(unittest.TestCase):
             font=("Segoe UI", 10, "bold"),
         )
 
+    def test_recording_popup_is_shown_only_while_recording_and_minimized(self):
+        app = MeetingControlApp.__new__(MeetingControlApp)
+        app.root = mock.Mock()
+        app.root.state.return_value = "iconic"
+        app._state = "recording"
+        app._recording_popup = None
+
+        with (
+            mock.patch.object(app, "_show_recording_popup") as show_popup,
+            mock.patch.object(app, "_close_recording_popup") as close_popup,
+        ):
+            app._sync_recording_popup()
+
+        show_popup.assert_called_once_with()
+        close_popup.assert_not_called()
+
+    def test_recording_popup_is_closed_after_recording_or_restore(self):
+        app = MeetingControlApp.__new__(MeetingControlApp)
+        app.root = mock.Mock()
+        app.root.state.return_value = "iconic"
+        app._state = "transcribing"
+        app._recording_popup = None
+
+        with mock.patch.object(app, "_close_recording_popup") as close_popup:
+            app._sync_recording_popup()
+
+        close_popup.assert_called_once_with()
+
+        app._close_recording_popup = mock.Mock()
+        app._restore_main_window()
+        app._close_recording_popup.assert_called_once_with()
+        app.root.deiconify.assert_called_once_with()
+        app.root.lift.assert_called_once_with()
+        app.root.focus_force.assert_called_once_with()
+
+    def test_root_minimize_event_schedules_popup_sync(self):
+        app = MeetingControlApp.__new__(MeetingControlApp)
+        app.root = mock.Mock()
+        event = mock.Mock()
+        event.widget = app.root
+
+        app._on_root_unmapped(event)
+
+        app.root.after_idle.assert_called_once_with(app._sync_recording_popup)
+
     def test_lists_completed_meetings_by_date_with_wav_duration(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_root = Path(temporary_dir)

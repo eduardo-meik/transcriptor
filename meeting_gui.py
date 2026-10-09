@@ -197,6 +197,8 @@ class MeetingControlApp:
         self._selected_system_label = ""
         self._session_summary_enabled = True
         self._summary_enabled = tk.BooleanVar(value=True)
+        self._recording_popup: tk.Toplevel | None = None
+        self._popup_timer_label: tk.Label | None = None
 
         self.root.title("Meik Labs | Asistente de reuniones")
         self.root.iconbitmap(str(Path(__file__).resolve().with_name("icon.ico")))
@@ -204,6 +206,8 @@ class MeetingControlApp:
         self.root.minsize(760, 660)
         self.root.configure(background="#f4f6f8")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.bind("<Unmap>", self._on_root_unmapped, add="+")
+        self.root.bind("<Map>", self._on_root_mapped, add="+")
         self._configure_styles()
         self._build_interface()
         self._refresh_meetings()
@@ -723,6 +727,82 @@ class MeetingControlApp:
         self.status_label.configure(text=title)
         self.phase_label.configure(text=detail)
         self._set_device_controls_enabled(state in {"idle", "ready", "complete", "error"})
+        self._sync_recording_popup()
+
+    def _on_root_unmapped(self, event: tk.Event[tk.Misc]) -> None:
+        if event.widget is self.root:
+            self.root.after_idle(self._sync_recording_popup)
+
+    def _on_root_mapped(self, event: tk.Event[tk.Misc]) -> None:
+        if event.widget is self.root:
+            self.root.after_idle(self._sync_recording_popup)
+
+    def _sync_recording_popup(self) -> None:
+        if self._state != "recording" or self.root.state() != "iconic":
+            self._close_recording_popup()
+            return
+        if self._recording_popup is None:
+            try:
+                self._show_recording_popup()
+            except tk.TclError:
+                logger.exception("Could not display the minimized recording status window")
+                self._close_recording_popup()
+
+    def _show_recording_popup(self) -> None:
+        popup = tk.Toplevel(self.root)
+        self._recording_popup = popup
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+        popup.configure(background="#ffffff")
+        popup.resizable(False, False)
+        popup.update_idletasks()
+        x_position = max(0, popup.winfo_screenwidth() - 330)
+        y_position = max(0, popup.winfo_screenheight() - 180)
+        popup.geometry(f"310x132+{x_position}+{y_position}")
+
+        card = tk.Frame(
+            popup,
+            background="#ffffff",
+            highlightbackground="#d0d5dd",
+            highlightthickness=1,
+            padx=14,
+            pady=12,
+        )
+        card.pack(fill="both", expand=True)
+        tk.Label(
+            card,
+            text="●  GRABACIÓN ACTIVA",
+            background="#ffffff",
+            foreground="#b42318",
+            font=("Segoe UI", 10, "bold"),
+        ).pack(anchor="w")
+        self._popup_timer_label = tk.Label(
+            card,
+            text=self.timer_label.cget("text"),
+            background="#ffffff",
+            foreground="#101828",
+            font=("Segoe UI", 20, "bold"),
+        )
+        self._popup_timer_label.pack(anchor="w", pady=(3, 4))
+        tk.Button(
+            card,
+            text="Volver a la ventana",
+            command=self._restore_main_window,
+            font=("Segoe UI", 9),
+        ).pack(anchor="e")
+
+    def _close_recording_popup(self) -> None:
+        popup = self._recording_popup
+        self._recording_popup = None
+        self._popup_timer_label = None
+        if popup is not None and popup.winfo_exists():
+            popup.destroy()
+
+    def _restore_main_window(self) -> None:
+        self._close_recording_popup()
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
 
     def _set_device_controls_enabled(self, enabled: bool) -> None:
         device_state = "readonly" if enabled else "disabled"
@@ -880,7 +960,10 @@ class MeetingControlApp:
         recorder = self._recorder
         if recorder is not None and self._state in {"recording", "stopping"}:
             elapsed = recorder.elapsed_seconds()
-            self.timer_label.configure(text=format_elapsed(elapsed))
+            formatted_elapsed = format_elapsed(elapsed)
+            self.timer_label.configure(text=formatted_elapsed)
+            if self._popup_timer_label is not None:
+                self._popup_timer_label.configure(text=formatted_elapsed)
             levels = recorder.levels()
             peaks = recorder.session_peaks()
             self._update_meter(

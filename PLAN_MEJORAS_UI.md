@@ -6,17 +6,23 @@ Hacer más visible el estado de grabación en Windows, actualizar la interfaz a
 un tema claro y reducir el espacio ocupado por el audio sin poner en riesgo una
 captura ni perder reuniones si falla la conversión.
 
+## Progreso
+
+- Tema claro y tipografía Segoe UI: implementados y probados; commit `63e85a8`.
+- Ventana compacta al minimizar: implementada; las 58 pruebas automatizadas
+  pasan. Queda pendiente la comprobación visual durante una reunión real en
+  Windows.
+- Conversión WAV→MP3 y validación del indicador en la barra de tareas: pendientes.
+
 ## Estado actual relevante
 
 - La aplicación usa Tkinter y una ventana principal con pestañas.
-- La interfaz actual tiene un tema oscuro y ya carga `icon.ico`.
+- La interfaz usa un tema claro y carga `icon.ico`.
 - La captura produce `meeting_audio.wav` dentro de la carpeta de la reunión.
 - La biblioteca calcula la duración leyendo ese WAV. El procesamiento posterior
   también se inicia a partir del audio capturado.
 - El estado de la interfaz se actualiza mediante mensajes y callbacks de Tkinter;
   la captura y el procesamiento no deben bloquear el hilo de la ventana.
-- El árbol de trabajo ya contiene otros cambios sin commit. Este plan no los
-  modifica.
 
 ## Propuesta de implementación
 

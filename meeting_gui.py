@@ -18,6 +18,12 @@ from typing import TypeAlias
 
 import sounddevice as sd
 
+from core.audio_optimizer import (
+    AudioOptimizationError,
+    AudioOptimizationReport,
+    optimize_wav_files,
+    read_mp3_duration,
+)
 from core.audio_recorder import AudioDeviceSelection, AudioRecorderError, MeetingAudioRecorder
 from core.capture_quality import SILENCE_PEAK, VERY_LOW_PEAK, capture_warnings
 from core.config import AppConfig
@@ -51,11 +57,13 @@ class MeetingComplete:
     transcript: Path
     report: Path | None
     analysis: Path | None
+    storage_optimization: AudioOptimizationReport = AudioOptimizationReport(converted=(), warnings=())
 
 
 @dataclass(frozen=True)
 class OperationFailed:
     message: str
+    storage_optimization: AudioOptimizationReport = AudioOptimizationReport(converted=(), warnings=())
 
 
 @dataclass(frozen=True)
@@ -90,7 +98,7 @@ def _device_label(index: int, name: str) -> str:
 
 
 def list_meetings(output_root: Path) -> list[MeetingEntry]:
-    """Find completed meetings and derive their duration from the saved WAV."""
+    """Find completed meetings and derive duration from their saved audio."""
 
     if not output_root.exists():
         return []
@@ -115,16 +123,24 @@ def list_meetings(output_root: Path) -> list[MeetingEntry]:
             meeting_date = datetime.fromtimestamp(meeting_dir.stat().st_mtime)
 
         audio_path = meeting_dir / "meeting_audio.wav"
+        if not audio_path.is_file():
+            audio_path = meeting_dir / "meeting_audio.mp3"
         duration_seconds: float | None = None
         if audio_path.is_file():
             try:
-                with wave.open(str(audio_path), "rb") as audio_file:
-                    frame_rate = audio_file.getframerate()
-                    if frame_rate > 0:
-                        duration_seconds = audio_file.getnframes() / frame_rate
-                    else:
-                        logger.warning("Could not determine meeting duration from %s: invalid sample rate", audio_path)
-            except (OSError, wave.Error) as exc:
+                if audio_path.suffix.casefold() == ".wav":
+                    with wave.open(str(audio_path), "rb") as audio_file:
+                        frame_rate = audio_file.getframerate()
+                        if frame_rate > 0:
+                            duration_seconds = audio_file.getnframes() / frame_rate
+                        else:
+                            logger.warning(
+                                "Could not determine meeting duration from %s: invalid sample rate",
+                                audio_path,
+                            )
+                else:
+                    duration_seconds = read_mp3_duration(audio_path)
+            except (AudioOptimizationError, OSError, wave.Error) as exc:
                 logger.warning("Could not read meeting audio duration from %s: %s", audio_path, exc)
 
         summary_path = meeting_dir / "meeting_report.md"
@@ -909,10 +925,34 @@ class MeetingControlApp:
                     encoding="utf-8",
                 )
 
-            self._messages.put(MeetingComplete(output_dir, transcript.markdown_path, report_path, analysis_path))
         except Exception as exc:
             logger.exception("Meeting recording or post-processing failed")
-            self._messages.put(OperationFailed(str(exc)))
+            storage_optimization = self._optimize_audio_after_processing(output_dir)
+            self._messages.put(OperationFailed(str(exc), storage_optimization))
+            return
+
+        storage_optimization = self._optimize_audio_after_processing(output_dir)
+        self._messages.put(
+            MeetingComplete(
+                output_dir,
+                transcript.markdown_path,
+                report_path,
+                analysis_path,
+                storage_optimization,
+            )
+        )
+
+    def _optimize_audio_after_processing(self, output_dir: Path) -> AudioOptimizationReport:
+        if not any(output_dir.glob("*.wav")):
+            return AudioOptimizationReport(converted=(), warnings=())
+        self._messages.put(
+            ProcessingPhase(
+                "OPTIMIZANDO AUDIO",
+                "Comprimiendo las pistas de audio para reducir el espacio usado...",
+                "optimizing",
+            )
+        )
+        return optimize_wav_files(output_dir)
 
     def _poll_messages(self) -> None:
         while True:
@@ -937,6 +977,11 @@ class MeetingControlApp:
                     details.append(f"Resumen: {message.report}")
                 if message.analysis is not None:
                     details.append(f"Analisis: {message.analysis}")
+                if message.storage_optimization.converted:
+                    details.append(
+                        f"Audio optimizado: {len(message.storage_optimization.converted)} archivo(s) MP3."
+                    )
+                details.extend(message.storage_optimization.warnings)
                 self.message_label.configure(text="\n".join(details))
                 self._output_dir = message.output_dir
                 self._refresh_meetings()
@@ -949,7 +994,8 @@ class MeetingControlApp:
                     self.root.destroy()
                     return
             else:
-                self.message_label.configure(text=f"Error: {message.message}")
+                details = [f"Error: {message.message}", *message.storage_optimization.warnings]
+                self.message_label.configure(text="\n".join(details))
                 self.start_button.configure(state="normal" if self._loopback_devices and self._microphone_devices else "disabled")
                 self.stop_button.configure(state="disabled")
                 self._set_status("OCURRIO UN ERROR", "Revisa el mensaje para ver el motivo y corregirlo.", "error")
@@ -1023,7 +1069,7 @@ class MeetingControlApp:
                 self._close_after_processing = True
                 self._stop()
             return
-        if self._state in {"starting", "stopping", "transcribing", "summarizing"}:
+        if self._state in {"starting", "stopping", "transcribing", "summarizing", "optimizing"}:
             messagebox.showwarning(
                 "Procesamiento en curso",
                 "Espera a que termine el procesamiento para cerrar y conservar los resultados.",

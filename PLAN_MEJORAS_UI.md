@@ -12,15 +12,21 @@ captura ni perder reuniones si falla la conversión.
 - Ventana compacta al minimizar: implementada; las 58 pruebas automatizadas
   pasan. Queda pendiente la comprobación visual durante una reunión real en
   Windows.
-- Conversión WAV→MP3 y validación del indicador en la barra de tareas: pendientes.
+- Conversión WAV→MP3: implementada y probada con 63 pruebas automatizadas,
+  incluida conversión real de WAV sintéticos con FFmpeg. Pendiente commit y
+  comprobación manual con una reunión real.
+- Indicador de ejecución en la barra de tareas: pendiente.
 
 ## Estado actual relevante
 
 - La aplicación usa Tkinter y una ventana principal con pestañas.
 - La interfaz usa un tema claro y carga `icon.ico`.
-- La captura produce `meeting_audio.wav` dentro de la carpeta de la reunión.
-- La biblioteca calcula la duración leyendo ese WAV. El procesamiento posterior
-  también se inicia a partir del audio capturado.
+- La captura y el procesamiento usan los WAV; al terminar todas las etapas se
+  convierten los WAV de la carpeta a MP3. Cada WAV solo se elimina tras validar
+  el MP3 correspondiente.
+- La biblioteca lee duración de MP3 nuevos y WAV históricos o retenidos.
+- La optimización necesita el ejecutable FFmpeg con `libmp3lame` en `PATH`.
+  Si no está disponible o falla, se conserva el WAV y se muestra una advertencia.
 - El estado de la interfaz se actualiza mediante mensajes y callbacks de Tkinter;
   la captura y el procesamiento no deben bloquear el hilo de la ventana.
 
@@ -73,9 +79,9 @@ captura ni perder reuniones si falla la conversión.
 6. Actualizar la biblioteca para obtener la duración de MP3 nuevos y WAV
    heredados. Mantener el soporte de WAV para reuniones existentes y reuniones
    cuya conversión haya fallado.
-7. Definir y documentar el método de conversión y su disponibilidad en Windows
-   (por ejemplo, FFmpeg instalado o distribuido con la aplicación) antes de
-   elegir dependencias o modificar el empaquetado.
+7. Usar FFmpeg disponible en `PATH` y documentar este requisito en Windows. La
+   aplicación no depende de la optimización para completar la reunión; validar
+   en el empaquetado de distribución si FFmpeg deberá incluirse o instalarse.
 
 ### 4. Indicador de aplicación en la barra de tareas de Windows
 

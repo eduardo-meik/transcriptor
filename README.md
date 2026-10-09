@@ -7,7 +7,7 @@ This workspace now contains two related workflows:
 
 ## Meeting Assistant
 
-The meeting assistant records Windows system audio through an available loopback/stereo-mix capture device and records your microphone as a second stream. When stopped, it mixes both sources into a 16 kHz mono WAV file, transcribes it locally with `faster-whisper`, and can optionally generate a Markdown report through OpenRouter.
+The meeting assistant records Windows system audio through an available loopback/stereo-mix capture device and records your microphone as a second stream. When stopped, it mixes both sources into a 16 kHz mono WAV file, transcribes it locally with `faster-whisper`, and can optionally generate a Markdown report through OpenRouter. Only after transcription and report generation finish, the app converts every WAV in the meeting folder to MP3 for storage. It validates each MP3 before removing its WAV source; if conversion or validation fails, the WAV is kept and the app reports a warning.
 
 ### Desktop control panel
 
@@ -88,13 +88,13 @@ python main.py --provider openrouter
 
 Outputs are saved under `outputs/<timestamp>/`:
 
-- `meeting_audio.wav`
-- `system_raw.wav`
-- `microphone_raw.wav`
+- MP3 equivalents of `meeting_audio.wav`, `microphone_raw.wav`, and captured system-loopback WAVs after successful optimization
 - `transcript_raw.txt`
 - `transcript_raw.md`
 - `transcript_segments.md`
 - `meeting_report.md` when summarization is enabled
+
+The app needs the FFmpeg command-line tool with `libmp3lame` available on `PATH` for WAV-to-MP3 storage optimization. If it is unavailable or conversion fails, processing results remain usable and the original WAV files are retained.
 
 > Privacy note: transcription is local. Summarization sends transcript text to the configured external provider (OpenRouter by default); use `--no-summary` for fully local processing.
 

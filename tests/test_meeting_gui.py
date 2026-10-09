@@ -137,6 +137,22 @@ class MeetingGuiTests(unittest.TestCase):
 
             self.assertEqual(list_meetings(Path(temporary_dir)), [])
 
+    def test_reads_duration_from_mp3_when_wav_is_not_present(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            meeting_dir = Path(temporary_dir) / "20260101_120000"
+            meeting_dir.mkdir()
+            (meeting_dir / "transcript_raw.md").write_text(
+                "# Raw Meeting Transcript\n\n---\n\nSe revisaron las ventas del trimestre.",
+                encoding="utf-8",
+            )
+            (meeting_dir / "meeting_audio.mp3").touch()
+
+            with mock.patch("meeting_gui.read_mp3_duration", return_value=125.0) as read_duration:
+                meetings = list_meetings(Path(temporary_dir))
+
+        read_duration.assert_called_once_with(meeting_dir / "meeting_audio.mp3")
+        self.assertEqual(meetings[0].duration_seconds, 125.0)
+
     def test_derives_a_short_title_locally_from_transcript_markdown(self):
         transcript = (
             "# Raw Meeting Transcript\n\n"

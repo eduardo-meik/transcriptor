@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 import main
+import meeting_gui
 from core.capture_quality import capture_warnings
 from meeting_gui import (
     MeetingControlApp,
@@ -22,6 +23,53 @@ from meeting_gui import (
 
 
 class MeetingGuiTests(unittest.TestCase):
+    def test_windows_identity_is_set_before_creating_tk(self):
+        calls = mock.Mock()
+        config = mock.Mock()
+        with (
+            mock.patch("meeting_gui._configure_windows_app_identity", calls.identity),
+            mock.patch("meeting_gui.tk.Tk", calls.create_root),
+            mock.patch("meeting_gui.MeetingControlApp", calls.create_app),
+        ):
+            self.assertEqual(meeting_gui.run_gui(config), 0)
+
+        self.assertEqual(calls.mock_calls, [
+            mock.call.identity(),
+            mock.call.create_root(),
+            mock.call.create_app(calls.create_root.return_value, config),
+            mock.call.create_root().mainloop(),
+        ])
+
+    def test_windows_identity_uses_explicit_app_id(self):
+        with (
+            mock.patch("meeting_gui.os.name", "nt"),
+            mock.patch("meeting_gui.ctypes.WinDLL", create=True) as load_library,
+        ):
+            set_app_id = load_library.return_value.SetCurrentProcessExplicitAppUserModelID
+            set_app_id.return_value = 0
+            meeting_gui._configure_windows_app_identity()
+
+        load_library.assert_called_once_with("shell32")
+        set_app_id.assert_called_once_with("MeikLabs.Transcriptor")
+
+    def test_windows_identity_failure_is_explicit(self):
+        with (
+            mock.patch("meeting_gui.os.name", "nt"),
+            mock.patch("meeting_gui.ctypes.WinDLL", create=True) as load_library,
+        ):
+            load_library.return_value.SetCurrentProcessExplicitAppUserModelID.return_value = -1
+            with self.assertRaisesRegex(OSError, "Windows application identity"):
+                meeting_gui._configure_windows_app_identity()
+
+    def test_non_windows_startup_skips_windows_identity(self):
+        with (
+            mock.patch("meeting_gui.os.name", "posix"),
+            mock.patch("meeting_gui.ctypes.WinDLL", create=True) as load_library,
+        ):
+            meeting_gui._configure_windows_app_identity()
+
+        load_library.assert_not_called()
+
     def test_formats_elapsed_time_with_hours(self):
         self.assertEqual(format_elapsed(0), "00:00:00")
         self.assertEqual(format_elapsed(65), "00:01:05")

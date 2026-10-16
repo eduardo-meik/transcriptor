@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import math
 import os
@@ -31,6 +32,22 @@ from core.summarizer import MeetingSummarizer, SummaryConfig
 from core.transcriber import FasterWhisperTranscriber, TranscriptionConfig
 
 logger = logging.getLogger(__name__)
+
+WINDOWS_APP_ID = "MeikLabs.Transcriptor"
+
+
+def _configure_windows_app_identity() -> None:
+    """Keep the desktop window separate from Python's taskbar group."""
+
+    if os.name != "nt":
+        return
+    shell32 = ctypes.WinDLL("shell32")
+    set_app_id = shell32.SetCurrentProcessExplicitAppUserModelID
+    set_app_id.argtypes = [ctypes.c_wchar_p]
+    set_app_id.restype = ctypes.c_long
+    result = set_app_id(WINDOWS_APP_ID)
+    if result != 0:
+        raise OSError(f"Could not set Windows application identity (HRESULT {result:#x})")
 
 
 @dataclass(frozen=True)
@@ -232,7 +249,9 @@ class MeetingControlApp:
         self._popup_timer_label: tk.Label | None = None
 
         self.root.title("Meik Labs | Asistente de reuniones")
-        self.root.iconbitmap(str(Path(__file__).resolve().with_name("icon.ico")))
+        icon_path = str(Path(__file__).resolve().with_name("icon.ico"))
+        self.root.iconbitmap(default=icon_path)
+        self.root.iconbitmap(icon_path)
         self.root.geometry("900x720")
         self.root.minsize(760, 660)
         self.root.configure(background="#f4f6f8")
@@ -1165,6 +1184,7 @@ class MeetingControlApp:
 def run_gui(config: AppConfig) -> int:
     """Create the desktop application and run its Tk event loop."""
 
+    _configure_windows_app_identity()
     root = tk.Tk()
     MeetingControlApp(root, config)
     root.mainloop()

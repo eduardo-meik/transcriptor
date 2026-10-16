@@ -22,6 +22,7 @@ The window lets you choose the WASAPI output and microphone, start and stop reco
 The **Reuniones** tab lists completed meetings with a locally derived title, date, and recorded audio duration. Select a meeting and choose **Cambiar nombre** to set a manual title; the override is saved in `meeting_title.txt` inside that meeting's output folder and remains after restarting the app. Otherwise, titles are taken from the transcript locally, without another AI request. Select a meeting to preview its `transcript_raw.md` file and copy its contents; use **Abrir archivo MD** to open it externally. **Ver resumen** opens `meeting_report.md` when one was generated. Use **Actualizar** to refresh the list.
 
 On Windows, a desktop shortcut can launch the window directly. It should target the environment's `pythonw.exe`, use `main.py --gui` as its arguments, and set this project directory as its working directory.
+Set the shortcut icon to this project's `icon.ico`. The GUI sets its own Windows application identity before creating any windows and uses `icon.ico` as the default window icon, so its running taskbar button is not grouped with Python. Restart the app after updating; an old pinned Python shortcut may need to be unpinned and replaced with the app's shortcut.
 
 ### Meeting Assistant Setup
 

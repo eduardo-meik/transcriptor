@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import queue
 import tempfile
 import unittest
 import wave
@@ -12,6 +13,7 @@ from core.capture_quality import capture_warnings
 from meeting_gui import (
     MeetingControlApp,
     MeetingEntry,
+    OperationFailed,
     derive_meeting_title,
     format_elapsed,
     format_meeting_duration,
@@ -58,6 +60,32 @@ class MeetingGuiTests(unittest.TestCase):
             padding=(14, 8),
             font=("Segoe UI", 10, "bold"),
         )
+
+    def test_processing_error_is_shown_in_a_dialog(self):
+        app = MeetingControlApp.__new__(MeetingControlApp)
+        app.root = mock.Mock()
+        app._messages = queue.Queue()
+        app._messages.put(OperationFailed("OpenRouter request failed: 401 - Unauthorized"))
+        app.message_label = mock.Mock()
+        app.start_button = mock.Mock()
+        app.stop_button = mock.Mock()
+        app._loopback_devices = {}
+        app._microphone_devices = {}
+        app._set_status = mock.Mock()
+        app._recorder = mock.Mock()
+
+        with mock.patch("meeting_gui.messagebox.showerror") as show_error:
+            app._poll_messages()
+
+        show_error.assert_called_once_with(
+            "Error de procesamiento",
+            "Error: OpenRouter request failed: 401 - Unauthorized",
+            parent=app.root,
+        )
+        app.message_label.configure.assert_called_once_with(
+            text="Error: OpenRouter request failed: 401 - Unauthorized"
+        )
+        self.assertIsNone(app._recorder)
 
     def test_recording_popup_is_shown_only_while_recording_and_minimized(self):
         app = MeetingControlApp.__new__(MeetingControlApp)

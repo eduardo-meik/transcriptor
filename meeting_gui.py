@@ -1076,11 +1076,13 @@ class MeetingControlApp:
                     return
             else:
                 details = [f"Error: {message.message}", *message.storage_optimization.warnings]
-                self.message_label.configure(text="\n".join(details))
+                error_details = "\n".join(details)
+                self.message_label.configure(text=error_details)
                 self.start_button.configure(state="normal" if self._loopback_devices and self._microphone_devices else "disabled")
                 self.stop_button.configure(state="disabled")
                 self._set_status("OCURRIO UN ERROR", "Revisa el mensaje para ver el motivo y corregirlo.", "error")
                 self._recorder = None
+                messagebox.showerror("Error de procesamiento", error_details, parent=self.root)
         self.root.after(120, self._poll_messages)
 
     def _update_live_status(self) -> None:

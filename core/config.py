@@ -10,9 +10,12 @@ from typing import Literal
 from dotenv import load_dotenv
 
 
-SummaryProvider = Literal["anthropic", "google"]
+SummaryProvider = Literal["openrouter", "anthropic", "google", "lmstudio"]
 
-DEFAULT_WHISPER_GLOSSARY_PATH = Path(__file__).resolve().parent.parent / "whisper_glossary.txt"
+DEFAULT_OPENROUTER_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_WHISPER_GLOSSARY_PATH = PROJECT_ROOT / "whisper_glossary.txt"
 
 
 def _load_whisper_glossary() -> str:
@@ -35,7 +38,7 @@ def _load_whisper_glossary() -> str:
         path = DEFAULT_WHISPER_GLOSSARY_PATH
 
     if path.exists():
-        terms = []
+        terms: list[str] = []
         for raw_line in path.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
             if not line or line.startswith("#"):
@@ -54,7 +57,7 @@ def _load_whisper_glossary() -> str:
 class AppConfig:
     """Runtime configuration loaded from environment variables."""
 
-    output_root: Path = Path("outputs")
+    output_root: Path = PROJECT_ROOT / "outputs"
     sample_rate: int = 16_000
     channels: int = 1
     language: str = "es"
@@ -64,9 +67,10 @@ class AppConfig:
     allow_cpu_fallback: bool = True
     initial_prompt: str | None = _load_whisper_glossary()
     enable_diarization: bool = False
-    summary_provider: SummaryProvider = "anthropic"
+    summary_provider: SummaryProvider = "openrouter"
     anthropic_model: str = "claude-3-5-sonnet-latest"
     google_model: str = "gemini-1.5-pro"
+    openrouter_model: str = DEFAULT_OPENROUTER_MODEL
 
 
 def load_config() -> AppConfig:
@@ -75,8 +79,12 @@ def load_config() -> AppConfig:
     load_dotenv()
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
     prompt = os.getenv("WHISPER_INITIAL_PROMPT") or _load_whisper_glossary()
+    # Resolve the output root against the project so results do not land in
+    # whatever directory the command happened to be launched from.
+    output_root_env = os.getenv("MEIK_OUTPUT_ROOT")
+    output_root = Path(output_root_env).expanduser() if output_root_env else PROJECT_ROOT / "outputs"
     return AppConfig(
-        output_root=Path(os.getenv("MEIK_OUTPUT_ROOT", "outputs")),
+        output_root=output_root,
         sample_rate=int(os.getenv("MEIK_SAMPLE_RATE", "16000")),
         channels=int(os.getenv("MEIK_CHANNELS", "1")),
         language=os.getenv("MEIK_LANGUAGE", "es"),
@@ -88,7 +96,8 @@ def load_config() -> AppConfig:
         initial_prompt=prompt,
         enable_diarization=os.getenv("WHISPER_ENABLE_DIARIZATION", "false").lower()
         in {"1", "true", "yes", "y"},
-        summary_provider=os.getenv("SUMMARY_PROVIDER", "anthropic"),  # type: ignore[arg-type]
+        summary_provider=os.getenv("SUMMARY_PROVIDER", "openrouter"),  # type: ignore[arg-type]
         anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest"),
         google_model=os.getenv("GOOGLE_MODEL", "gemini-1.5-pro"),
+        openrouter_model=os.getenv("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL),
     )

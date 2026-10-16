@@ -37,7 +37,7 @@ class RecordingResult:
     duration_seconds: float
 
 
-class _QueueWriter:
+class AudioChunkWriter:
     """Write audio chunks from a callback thread into a WAV file."""
 
     def __init__(self, output_path: Path, sample_rate: int, channels: int) -> None:
@@ -87,16 +87,59 @@ class MeetingAudioRecorder:
         target_sample_rate: int = 16_000,
         target_channels: int = 1,
         devices: AudioDeviceSelection | None = None,
+        backend: str = "stereo-mix",
+        loopback_device_name: str | None = None,
+        loopback_device_index: int | None = None,
+        microphone_device_name: str | None = None,
+        system_only: bool = False,
     ) -> None:
         self.output_dir = output_dir
         self.target_sample_rate = target_sample_rate
         self.target_channels = target_channels
         self.devices = devices or AudioDeviceSelection()
+        self.backend = backend
+        self.loopback_device_name = loopback_device_name
+        self.loopback_device_index = loopback_device_index
+        self.microphone_device_name = microphone_device_name
+        self.system_only = system_only
         self._streams: list[sd.InputStream] = []
-        self._writers: list[_QueueWriter] = []
+        self._writers: list[AudioChunkWriter] = []
+        self._loopback = None
+        self._loopback_device = None
         self._started_at: float | None = None
         self._system_raw_path: Path | None = None
         self._microphone_raw_path: Path | None = None
+        self._level_lock = threading.Lock()
+        self._levels: dict[str, float] = {"system": 0.0, "microphone": 0.0}
+        # Peak per source across the whole session, so a silent channel can be
+        # reported after recording instead of only being noticed in the transcript.
+        self._session_peaks: dict[str, float] = {"system": 0.0, "microphone": 0.0}
+
+    def levels(self) -> dict[str, float]:
+        """Return peak amplitude per source since the last call, then reset it."""
+
+        with self._level_lock:
+            snapshot = dict(self._levels)
+            self._levels = {key: 0.0 for key in self._levels}
+        if self._loopback is not None:
+            snapshot["system"] = max(snapshot.get("system", 0.0), self._loopback.levels())
+        return snapshot
+
+    def session_peaks(self) -> dict[str, float]:
+        """Return the peak amplitude per source over the whole recording session."""
+
+        with self._level_lock:
+            snapshot = dict(self._session_peaks)
+        if self._loopback is not None:
+            snapshot["system"] = max(snapshot.get("system", 0.0), self._loopback.session_peak())
+        return snapshot
+
+    def elapsed_seconds(self) -> float:
+        """Return how long the current recording has been running."""
+
+        if self._started_at is None:
+            return 0.0
+        return time.monotonic() - self._started_at
 
     @staticmethod
     def list_devices() -> str:
@@ -106,39 +149,143 @@ class MeetingAudioRecorder:
         lines = ["Audio devices:"]
         for index, device in enumerate(sd.query_devices()):
             host_api_name = host_apis[device["hostapi"]]["name"]
+            # Device names can contain embedded newlines (Bluetooth hands-free
+            # endpoints), which would break the one-device-per-line format.
+            device_name = " ".join(str(device["name"]).split())
             hint = ""
-            if _looks_like_system_capture_device(str(device["name"])) and device["max_input_channels"] > 0:
+            if _looks_like_system_capture_device(device_name) and device["max_input_channels"] > 0:
                 hint = " | system-capture-candidate"
             lines.append(
-                f"[{index}] {device['name']} | {host_api_name} | "
+                f"[{index}] {device_name} | {host_api_name} | "
                 f"in={device['max_input_channels']} out={device['max_output_channels']} | "
                 f"default_sr={int(device['default_samplerate'])}{hint}"
             )
         return "\n".join(lines)
 
+    @staticmethod
+    def wasapi_settings(device_index: int):
+        """Return auto-converting WASAPI settings for WASAPI devices.
+
+        Without ``auto_convert`` some Realtek microphone-array endpoints return
+        near-silence: the requested format does not match the endpoint's native
+        mix and the Windows audio-processing chain is bypassed. Letting WASAPI
+        convert keeps the voice processing active and yields a normal level.
+        """
+
+        try:
+            host_api_index = sd.query_devices(device_index)["hostapi"]
+            host_api_name = str(sd.query_hostapis(host_api_index)["name"]).upper()
+        except (sd.PortAudioError, KeyError, IndexError, ValueError):
+            return None
+        if host_api_name.endswith("WASAPI"):
+            return sd.WasapiSettings(auto_convert=True)
+        return None
+
+    @staticmethod
+    def default_wasapi_input() -> int | None:
+        """Return the WASAPI default input device index, if one is configured.
+
+        ``sd.default.device`` reports the MME default, which is a different
+        endpoint than the one Windows (and Teams) actually use. Preferring the
+        WASAPI default also keeps ``auto_convert`` available.
+        """
+
+        for host_api in sd.query_hostapis():
+            if str(host_api["name"]).upper().endswith("WASAPI"):
+                index = int(host_api["default_input_device"])
+                if index >= 0:
+                    return index
+                break
+        return None
+
+    def resolve_microphone_device(self) -> int:
+        """Return the microphone index to capture from.
+
+        Priority: an explicit device index, then a device matched by name, then
+        the WASAPI default input, and finally the system default input.
+        """
+
+        if self.devices.microphone_device is not None:
+            return self.devices.microphone_device
+
+        if self.microphone_device_name:
+            matched = find_input_device_by_name(endpoint_match_key(self.microphone_device_name))
+            if matched is not None:
+                return matched
+
+        wasapi_default = self.default_wasapi_input()
+        if wasapi_default is not None:
+            return wasapi_default
+
+        default_device = sd.default.device[0]
+        if default_device is None or int(default_device) < 0:
+            raise AudioRecorderError("No default microphone device is configured.")
+        return int(default_device)
+
+    def resolve_system_capture_device(self) -> int:
+        """Return the device index that will be used for system-audio capture."""
+
+        return self._resolve_system_capture_device()
+
+    @staticmethod
+    def find_supported_input_settings(device_index: int) -> tuple[int, int]:
+        """Return a ``(sample_rate, channels)`` pair that the device accepts."""
+
+        return MeetingAudioRecorder._find_supported_input_settings(device_index)
+
     def check_devices(self) -> str:
         """Return supported stream settings for the configured devices."""
 
-        system_device = self._resolve_system_capture_device()
-        system_sample_rate, system_channels = self._find_supported_input_settings(system_device)
+        if self.backend == "wasapi-loopback":
+            from core.wasapi_loopback import WasapiLoopbackRecorder
 
-        microphone_device = self.devices.microphone_device
-        if microphone_device is None:
-            microphone_device = sd.default.device[0]
-        if microphone_device is None or microphone_device < 0:
-            raise AudioRecorderError("No default microphone device is configured.")
+            loopback = WasapiLoopbackRecorder(
+                self.output_dir,
+                target_sample_rate=self.target_sample_rate,
+                device_name_hint=self.loopback_device_name,
+                device_index=self.loopback_device_index,
+            )
+            device = loopback.resolve_device()
+            system_line = (
+                f"system loopback device {device.index}: {device.clean_name} "
+                f"@ {device.sample_rate} Hz, {device.channels} channel(s)"
+            )
+        else:
+            system_device = self._resolve_system_capture_device()
+            system_sample_rate, system_channels = self._find_supported_input_settings(system_device)
+            system_line = (
+                f"system device {system_device}: {system_sample_rate} Hz, {system_channels} channel(s)"
+            )
+
+        if self.system_only:
+            return "\n".join(
+                [
+                    f"Device check OK (backend: {self.backend}, system-only):",
+                    system_line,
+                    "microphone: omitido (--system-only)",
+                ]
+            )
+
+        microphone_device = self.resolve_microphone_device()
         mic_sample_rate, mic_channels = self._find_supported_input_settings(microphone_device)
 
+        mic_info = sd.query_devices(microphone_device)
+        mic_label = " ".join(str(mic_info["name"]).split())
         return "\n".join(
             [
-                "Device check OK:",
-                f"system device {system_device}: {system_sample_rate} Hz, {system_channels} channel(s)",
-                f"microphone device {microphone_device}: {mic_sample_rate} Hz, {mic_channels} channel(s)",
+                f"Device check OK (backend: {self.backend}):",
+                system_line,
+                f"microphone device {microphone_device}: {mic_label} "
+                f"@ {mic_sample_rate} Hz, {mic_channels} channel(s)",
             ]
         )
 
-    def start(self) -> None:
-        """Start recording system output and microphone input."""
+    def start(self):
+        """Start recording system output and microphone input.
+
+        Returns the loopback device descriptor when the WASAPI backend is used,
+        otherwise ``None``.
+        """
 
         if self._started_at is not None:
             raise AudioRecorderError("Recording is already running.")
@@ -148,27 +295,36 @@ class MeetingAudioRecorder:
         self._microphone_raw_path = self.output_dir / "microphone_raw.wav"
 
         try:
-            self._start_system_loopback()
+            if self.backend == "wasapi-loopback":
+                self._start_wasapi_loopback()
+            else:
+                self._start_system_loopback()
         except (AudioRecorderError, sd.PortAudioError, OSError, RuntimeError, ValueError) as exc:
             self._stop_writers()
             raise AudioRecorderError(
                 "Could not start system-audio capture. "
-                "Run `python main.py --list-devices` and choose a system-capture-candidate device. "
+                "Run `python main.py --list-devices` and choose a system-capture-candidate device, "
+                "or use `--backend wasapi-loopback`. "
                 f"Original error: {exc}"
             ) from exc
 
         try:
-            self._start_microphone_capture()
+            if self.system_only:
+                print("System-only mode: el microfono no se capturara.")
+            else:
+                self._start_microphone_capture()
         except (AudioRecorderError, sd.PortAudioError, OSError, RuntimeError, ValueError) as exc:
             self._close_streams()
             self._stop_writers()
             raise AudioRecorderError(
                 "Could not start microphone capture. "
-                "Run `python main.py --list-devices` and choose a valid input device. "
+                "Run `python main.py --list-devices` and choose a valid input device, "
+                "or use `--system-only` to record without a microphone. "
                 f"Original error: {exc}"
             ) from exc
 
         self._started_at = time.monotonic()
+        return self._loopback_device
 
     def stop(self) -> RecordingResult:
         """Stop recording, mix sources, and return generated file paths."""
@@ -178,11 +334,19 @@ class MeetingAudioRecorder:
 
         duration = time.monotonic() - self._started_at
         self._close_streams()
+        if self._loopback is not None:
+            raw_path, _mono_path = self._loopback.stop()
+            self._system_raw_path = raw_path
+            loopback_peak = self._loopback.session_peak()
+            with self._level_lock:
+                if loopback_peak > self._session_peaks.get("system", 0.0):
+                    self._session_peaks["system"] = loopback_peak
+            self._loopback = None
         for writer in self._writers:
             writer.stop()
 
         mixed_path = self.output_dir / "meeting_audio.wav"
-        self._mix_to_target_wav(mixed_path)
+        self.mix_to_target_wav(mixed_path)
         self._started_at = None
 
         return RecordingResult(
@@ -192,10 +356,28 @@ class MeetingAudioRecorder:
             duration_seconds=duration,
         )
 
+    def _start_wasapi_loopback(self) -> None:
+        """Capture system audio through WASAPI loopback (works with Bluetooth)."""
+
+        # Imported lazily: core.wasapi_loopback depends on the shared helpers in
+        # this module, so a module-level import would be circular.
+        from core.wasapi_loopback import WasapiLoopbackRecorder
+
+        loopback = WasapiLoopbackRecorder(
+            self.output_dir,
+            target_sample_rate=self.target_sample_rate,
+            device_name_hint=self.loopback_device_name,
+            device_index=self.loopback_device_index,
+        )
+        loopback.start()
+        self._loopback = loopback
+        self._loopback_device = loopback.device
+        self._system_raw_path = loopback.raw_path
+
     def _start_system_loopback(self) -> None:
         capture_device = self._resolve_system_capture_device()
         sample_rate, channels = self._find_supported_input_settings(capture_device)
-        writer = _QueueWriter(self._system_raw_path or self.output_dir / "system_raw.wav", sample_rate, channels)
+        writer = AudioChunkWriter(self._system_raw_path or self.output_dir / "system_raw.wav", sample_rate, channels)
         writer.start()
         try:
             stream = sd.InputStream(
@@ -204,6 +386,7 @@ class MeetingAudioRecorder:
                 channels=channels,
                 dtype="float32",
                 callback=self._make_callback(writer, "system"),
+                extra_settings=self.wasapi_settings(capture_device),
             )
             stream.start()
         except (sd.PortAudioError, OSError, RuntimeError, ValueError):
@@ -213,14 +396,12 @@ class MeetingAudioRecorder:
         self._streams.append(stream)
 
     def _start_microphone_capture(self) -> None:
-        microphone_device = self.devices.microphone_device
-        if microphone_device is None:
-            microphone_device = sd.default.device[0]
-        if microphone_device is None or microphone_device < 0:
+        microphone_device = self.resolve_microphone_device()
+        if microphone_device < 0:
             raise AudioRecorderError("No default microphone device is configured.")
 
         sample_rate, channels = self._find_supported_input_settings(microphone_device)
-        writer = _QueueWriter(
+        writer = AudioChunkWriter(
             self._microphone_raw_path or self.output_dir / "microphone_raw.wav",
             sample_rate,
             channels,
@@ -233,6 +414,7 @@ class MeetingAudioRecorder:
                 channels=channels,
                 dtype="float32",
                 callback=self._make_callback(writer, "microphone"),
+                extra_settings=self.wasapi_settings(microphone_device),
             )
             stream.start()
         except (sd.PortAudioError, OSError, RuntimeError, ValueError):
@@ -290,8 +472,7 @@ class MeetingAudioRecorder:
             f"Tried sample rates {sample_rates} and channels {channel_counts}."
         )
 
-    @staticmethod
-    def _make_callback(writer: _QueueWriter, label: str) -> sd.CallbackFlags:
+    def _make_callback(self, writer: AudioChunkWriter, label: str) -> sd.CallbackFlags:
         def callback(
             indata: np.ndarray,
             _frames: int,
@@ -301,8 +482,23 @@ class MeetingAudioRecorder:
             if status:
                 print(f"Audio warning ({label}): {status}")
             writer.write(indata)
+            self.record_level(label, indata)
 
         return callback  # type: ignore[return-value]
+
+    def record_level(self, label: str, indata: np.ndarray) -> None:
+        """Track the peak amplitude seen for a source since the last ``levels()`` call."""
+
+        array = np.asarray(indata, dtype=np.float32)
+        mono = array.mean(axis=1) if array.ndim > 1 else array
+        if mono.size == 0:
+            return
+        peak = float(np.max(np.abs(mono)))
+        with self._level_lock:
+            if peak > self._levels.get(label, 0.0):
+                self._levels[label] = peak
+            if peak > self._session_peaks.get(label, 0.0):
+                self._session_peaks[label] = peak
 
     def _close_streams(self) -> None:
         while self._streams:
@@ -315,9 +511,12 @@ class MeetingAudioRecorder:
             writer = self._writers.pop()
             writer.stop()
 
-    def _mix_to_target_wav(self, output_path: Path) -> None:
-        system_audio = self._load_resampled_mono(self._system_raw_path)
-        microphone_audio = self._load_resampled_mono(self._microphone_raw_path)
+    def mix_to_target_wav(self, output_path: Path) -> None:
+        """Mix both raw sources into a resampled mono WAV at the target rate."""
+        system_path = self._system_raw_path or self.output_dir / "system_raw.wav"
+        microphone_path = self._microphone_raw_path or self.output_dir / "microphone_raw.wav"
+        system_audio = self._load_resampled_mono(system_path)
+        microphone_audio = self._load_resampled_mono(microphone_path)
         max_length = max(len(system_audio), len(microphone_audio))
         if max_length == 0:
             raise AudioRecorderError("No audio samples were captured.")
@@ -333,27 +532,86 @@ class MeetingAudioRecorder:
         self._validate_wav(output_path)
 
     def _load_resampled_mono(self, path: Path | None) -> np.ndarray:
-        if path is None or not path.exists() or path.stat().st_size == 0:
-            return np.array([], dtype=np.float32)
-
-        audio, sample_rate = sf.read(path, dtype="float32", always_2d=True)
-        mono = audio.mean(axis=1)
-        if sample_rate != self.target_sample_rate:
-            gcd = np.gcd(sample_rate, self.target_sample_rate)
-            mono = resample_poly(mono, self.target_sample_rate // gcd, sample_rate // gcd).astype(np.float32)
-        return mono
+        return load_resampled_mono(path, self.target_sample_rate)
 
     @staticmethod
     def _pad(audio: np.ndarray, target_length: int) -> np.ndarray:
-        if len(audio) >= target_length:
-            return audio[:target_length]
-        return np.pad(audio, (0, target_length - len(audio)))
+        return pad_to_length(audio, target_length)
 
     @staticmethod
     def _validate_wav(path: Path) -> None:
         with wave.open(str(path), "rb") as wav_file:
             if wav_file.getnframes() == 0:
                 raise AudioRecorderError(f"Generated WAV has no audio frames: {path}")
+
+
+def find_input_device_by_name(name: str) -> int | None:
+    """Return the input device index whose name matches, preferring WASAPI.
+
+    Device names contain embedded newlines on Bluetooth endpoints, so both the
+    candidate names and the hint are normalised before comparing.
+    """
+
+    hint = name.casefold()
+    if not hint:
+        return None
+
+    host_apis = sd.query_hostapis()
+    fallback: int | None = None
+    for index, device in enumerate(sd.query_devices()):
+        if int(device["max_input_channels"]) <= 0:
+            continue
+        device_name = " ".join(str(device["name"]).split()).casefold()
+        if hint not in device_name:
+            continue
+        if str(host_apis[device["hostapi"]]["name"]).upper().endswith("WASAPI"):
+            return index
+        if fallback is None:
+            fallback = index
+    return fallback
+
+
+def endpoint_match_key(name: str) -> str:
+    """Return a distinctive substring used to pair an output and its microphone.
+
+    A headset exposes two endpoints with different names, for example
+    ``Auriculares (AirPods Pro)`` for playback and
+    ``Auriculares con microfono (AirPods Pro)`` for capture. The parenthesised
+    part is the stable, vendor-specific piece shared by both.
+    """
+
+    cleaned = " ".join(name.split())
+    if "(" in cleaned and ")" in cleaned:
+        return cleaned[cleaned.index("(") : cleaned.rindex(")") + 1]
+    return cleaned
+
+
+def load_resampled_mono(path: Path | None, target_sample_rate: int) -> np.ndarray:
+    """Load a mono float32 signal from a WAV file, resampled to the target rate."""
+
+    if path is None or not path.exists() or path.stat().st_size == 0:
+        return np.array([], dtype=np.float32)
+
+    audio, sample_rate = sf.read(path, dtype="float32", always_2d=True)
+    mono = audio.mean(axis=1)
+    if sample_rate != target_sample_rate:
+        gcd = np.gcd(sample_rate, target_sample_rate)
+        mono = resample_poly(mono, target_sample_rate // gcd, sample_rate // gcd).astype(np.float32)
+    return mono
+
+
+def pad_to_length(audio: np.ndarray, target_length: int) -> np.ndarray:
+    """Trim or zero-pad a signal so it has exactly ``target_length`` samples."""
+
+    if len(audio) >= target_length:
+        return audio[:target_length]
+    return np.pad(audio, (0, target_length - len(audio)))
+
+
+def looks_like_system_capture_device(name: str) -> bool:
+    """Return whether a device name looks like a loopback/stereo-mix endpoint."""
+
+    return _looks_like_system_capture_device(name)
 
 
 def _looks_like_system_capture_device(name: str) -> bool:

@@ -7,7 +7,22 @@ This workspace now contains two related workflows:
 
 ## Meeting Assistant
 
-The meeting assistant records Windows system audio through an available loopback/stereo-mix capture device and records your microphone as a second stream. When stopped, it mixes both sources into a 16 kHz mono WAV file, transcribes it locally with `faster-whisper`, and can optionally generate a Markdown report through Anthropic or Google GenAI.
+The meeting assistant records Windows system audio through an available loopback/stereo-mix capture device and records your microphone as a second stream. When stopped, it mixes both sources into a 16 kHz mono WAV file, transcribes it locally with `faster-whisper`, and can optionally generate a Markdown report through OpenRouter. Only after transcription and report generation finish, the app converts every WAV in the meeting folder to MP3 for storage. It validates each MP3 before removing its WAV source; if conversion or validation fails, the WAV is kept and the app reports a warning.
+
+### Desktop control panel
+
+Run the meeting assistant with a desktop window:
+
+```bash
+python main.py --gui
+```
+
+The window lets you choose the WASAPI output and microphone, start and stop recording, and monitor each source's live audio level and meeting duration. It reports when a source is silent or unusually quiet. The interface uses a light palette and Segoe UI. When minimized during a recording, a small status window shows the elapsed time and can restore the main window. Transcription and the optional summary/analysis start after recording stops; transcription is not live. The summary checkbox is enabled by default and uses the provider configured in `.env`.
+
+The **Reuniones** tab lists completed meetings with a locally derived title, date, and recorded audio duration. Select a meeting and choose **Cambiar nombre** to set a manual title; the override is saved in `meeting_title.txt` inside that meeting's output folder and remains after restarting the app. Otherwise, titles are taken from the transcript locally, without another AI request. Select a meeting to preview its `transcript_raw.md` file and copy its contents; use **Abrir archivo MD** to open it externally. **Ver resumen** opens `meeting_report.md` when one was generated. Use **Actualizar** to refresh the list.
+
+On Windows, a desktop shortcut can launch the window directly. It should target the environment's `pythonw.exe`, use `main.py --gui` as its arguments, and set this project directory as its working directory.
+Set the shortcut icon to this project's `icon.ico`. The GUI sets its own Windows application identity before creating any windows and uses `icon.ico` as the default window icon, so its running taskbar button is not grouped with Python. Restart the app after updating; an old pinned Python shortcut may need to be unpinned and replaced with the app's shortcut.
 
 ### Meeting Assistant Setup
 
@@ -19,14 +34,12 @@ pip install -r requirements.txt
 
 For NVIDIA/CUDA acceleration, install a PyTorch/CUDA stack compatible with your driver and GPU before using `faster-whisper`. The app defaults to `device="cuda"` and `compute_type="float16"`, with CPU fallback enabled through configuration.
 
-Create a `.env` file only if you want API-based summaries:
+Copy `.env.example` to `.env` and add your OpenRouter key to enable summaries:
 
 ```env
-SUMMARY_PROVIDER=anthropic
-ANTHROPIC_API_KEY=your_key_here
-# or
-# SUMMARY_PROVIDER=google
-# GOOGLE_API_KEY=your_key_here
+SUMMARY_PROVIDER=openrouter
+OPENROUTER_API_KEY=your_openrouter_key_here
+OPENROUTER_MODEL=nvidia/nemotron-3-ultra-550b-a55b
 
 WHISPER_MODEL=large-v3
 WHISPER_DEVICE=cuda
@@ -37,6 +50,8 @@ HF_HUB_DISABLE_SYMLINKS_WARNING=1
 # Optional, only for higher Hugging Face download limits:
 # HF_TOKEN=your_huggingface_token_here
 ```
+
+Recording and transcription work without an OpenRouter key. Only the optional summary and meeting analysis send transcript text to OpenRouter. To avoid external processing, uncheck the summary option in the desktop panel or pass `--no-summary` in CLI mode.
 
 The first transcription may download the `faster-whisper` model from Hugging Face. An unauthenticated HF Hub warning is normal; configure `HF_TOKEN` only if downloads are rate-limited or slow. The Windows symlink cache warning is harmless and disabled by default in the app.
 
@@ -66,23 +81,23 @@ Validate selected devices without starting a recording:
 python main.py --system-device 20 --mic-device 14 --check-devices
 ```
 
-Run full recording, transcription, and summary:
+Run full recording, transcription, and OpenRouter summary:
 
 ```bash
-python main.py --provider anthropic
+python main.py --provider openrouter
 ```
 
 Outputs are saved under `outputs/<timestamp>/`:
 
-- `meeting_audio.wav`
-- `system_raw.wav`
-- `microphone_raw.wav`
+- MP3 equivalents of `meeting_audio.wav`, `microphone_raw.wav`, and captured system-loopback WAVs after successful optimization
 - `transcript_raw.txt`
 - `transcript_raw.md`
 - `transcript_segments.md`
 - `meeting_report.md` when summarization is enabled
 
-> Privacy note: transcription is local. Summarization through Anthropic or Google sends transcript text to an external API, so use `--no-summary` for fully local processing.
+The app needs the FFmpeg command-line tool with `libmp3lame` available on `PATH` for WAV-to-MP3 storage optimization. If it is unavailable or conversion fails, processing results remain usable and the original WAV files are retained.
+
+> Privacy note: transcription is local. Summarization sends transcript text to the configured external provider (OpenRouter by default); use `--no-summary` for fully local processing.
 
 ---
 

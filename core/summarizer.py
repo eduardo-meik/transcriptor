@@ -47,7 +47,7 @@ class MeetingSummarizer:
         provider = self._create_provider()
         report = provider.summarize(transcript)
         report_path = output_dir / "meeting_report.md"
-        report_path.write_text(report.strip() + "\n", encoding="utf-8")
+        report_path.write_text(report.strip() + "\n", encoding="utf-8-sig")
         return report_path
 
     def cleanup_transcript(self, transcript: str) -> str:
@@ -170,6 +170,7 @@ class _OpenRouterProvider:
             raise SummaryError(f"OpenRouter request failed: {response.status_code} - {response.text[:400]}")
 
         try:
+            response.encoding = "utf-8"
             body = response.json()
             content = body["choices"][0]["message"]["content"]
             if not isinstance(content, str) or not content.strip():
@@ -302,6 +303,7 @@ class _LMStudioProvider:
         )
         if response.status_code >= 400:
             raise SummaryError(f"LM Studio request failed: {response.status_code} - {response.text[:400]}")
+        response.encoding = "utf-8"
         body = response.json()
         try:
             return body["choices"][0]["message"]["content"].strip()

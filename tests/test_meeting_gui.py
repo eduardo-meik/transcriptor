@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import wave
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -10,6 +11,7 @@ import main
 from core.capture_quality import capture_warnings
 from meeting_gui import (
     MeetingControlApp,
+    MeetingEntry,
     derive_meeting_title,
     format_elapsed,
     format_meeting_duration,
@@ -180,6 +182,89 @@ class MeetingGuiTests(unittest.TestCase):
 
         self.assertEqual(meetings[0].title, "Se revisaron las ventas del trimestre")
         self.assertEqual(meetings[0].summary_path.name, "meeting_report.md")
+
+    def test_manual_meeting_title_overrides_transcript_derived_title(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            meeting_dir = Path(temporary_dir) / "20260101_120000"
+            meeting_dir.mkdir()
+            (meeting_dir / "transcript_raw.md").write_text(
+                "# Raw Meeting Transcript\n\n---\n\nSe revisaron las ventas del trimestre.",
+                encoding="utf-8",
+            )
+            (meeting_dir / "meeting_title.txt").write_text("Planificación Q4\n", encoding="utf-8")
+
+            meetings = list_meetings(Path(temporary_dir))
+
+        self.assertEqual(meetings[0].title, "Planificación Q4")
+
+    def test_rename_selected_meeting_saves_override_and_updates_library(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            meeting_dir = Path(temporary_dir) / "20260101_120000"
+            meeting_dir.mkdir()
+            transcript_path = meeting_dir / "transcript_raw.md"
+            transcript_path.write_text(
+                "# Raw Meeting Transcript\n\n---\n\nSe revisaron las ventas del trimestre.",
+                encoding="utf-8",
+            )
+            entry = MeetingEntry(
+                title="Se revisaron las ventas del trimestre",
+                meeting_date=datetime(2026, 1, 1, 12, 0),
+                duration_seconds=60,
+                transcript_path=transcript_path,
+                summary_path=None,
+            )
+            app = MeetingControlApp.__new__(MeetingControlApp)
+            app.root = mock.Mock()
+            app.meetings_table = mock.Mock()
+            app.meetings_table.selection.return_value = ("0",)
+            app.meetings_table.item.return_value = (
+                entry.title,
+                "01/01/2026 12:00",
+                "00:01:00",
+                "Ver",
+                "—",
+            )
+            app._meeting_entries = {"0": entry}
+            app.preview_title_label = mock.Mock()
+
+            with mock.patch("meeting_gui.simpledialog.askstring", return_value="  Planificación Q4  "):
+                app._rename_selected_meeting()
+
+            self.assertEqual(
+                (meeting_dir / "meeting_title.txt").read_text(encoding="utf-8").strip(),
+                "Planificación Q4",
+            )
+            self.assertEqual(app._meeting_entries["0"].title, "Planificación Q4")
+            app.meetings_table.item.assert_called_with(
+                "0",
+                values=("Planificación Q4", "01/01/2026 12:00", "00:01:00", "Ver", "—"),
+            )
+            app.preview_title_label.configure.assert_called_once_with(text="Planificación Q4")
+            self.assertEqual(list_meetings(Path(temporary_dir))[0].title, "Planificación Q4")
+
+    def test_rename_selected_meeting_rejects_empty_title(self):
+        app = MeetingControlApp.__new__(MeetingControlApp)
+        app.root = mock.Mock()
+        app.meetings_table = mock.Mock()
+        app.meetings_table.selection.return_value = ("0",)
+        entry = MeetingEntry(
+            title="Nombre original",
+            meeting_date=datetime(2026, 1, 1, 12, 0),
+            duration_seconds=None,
+            transcript_path=Path("meeting/transcript_raw.md"),
+            summary_path=None,
+        )
+        app._meeting_entries = {"0": entry}
+
+        with (
+            mock.patch("meeting_gui.simpledialog.askstring", return_value="   "),
+            mock.patch("meeting_gui.messagebox.showwarning") as show_warning,
+        ):
+            app._rename_selected_meeting()
+
+        show_warning.assert_called_once()
+        self.assertEqual(app._meeting_entries["0"].title, "Nombre original")
+        app.meetings_table.item.assert_not_called()
 
     @staticmethod
     def _write_wav(path: Path, seconds: int) -> None:

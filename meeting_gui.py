@@ -13,7 +13,7 @@ import wave
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 from typing import TypeAlias
 
 import sounddevice as sd
@@ -75,6 +75,9 @@ class MeetingEntry:
     summary_path: Path | None
 
 
+MEETING_TITLE_FILENAME = "meeting_title.txt"
+
+
 GuiMessage: TypeAlias = RecordingStarted | CaptureSaved | ProcessingPhase | MeetingComplete | OperationFailed
 
 
@@ -112,10 +115,22 @@ def list_meetings(output_root: Path) -> list[MeetingEntry]:
             continue
 
         try:
-            title = derive_meeting_title(transcript_path.read_text(encoding="utf-8"))
+            title = derive_meeting_title(transcript_path.read_text(encoding="utf-8-sig"))
         except (OSError, UnicodeError) as exc:
             logger.warning("Could not read meeting transcript %s to derive its title: %s", transcript_path, exc)
             title = meeting_dir.name
+
+        title_path = meeting_dir / MEETING_TITLE_FILENAME
+        if title_path.is_file():
+            try:
+                manual_title = title_path.read_text(encoding="utf-8-sig").strip()
+            except (OSError, UnicodeError) as exc:
+                logger.warning("Could not read manual meeting title %s: %s", title_path, exc)
+            else:
+                if manual_title:
+                    title = manual_title
+                else:
+                    logger.warning("Ignoring empty manual meeting title in %s", title_path)
 
         try:
             meeting_date = datetime.strptime(meeting_dir.name, "%Y%m%d_%H%M%S")
@@ -405,12 +420,20 @@ class MeetingControlApp:
             style="Refresh.TButton",
             command=self._refresh_meetings,
         ).pack(side="right")
+        self.rename_meeting_button = ttk.Button(
+            header,
+            text="Cambiar nombre",
+            style="Refresh.TButton",
+            command=self._rename_selected_meeting,
+            state="disabled",
+        )
+        self.rename_meeting_button.pack(side="right", padx=(0, 8))
 
         card = self._card(container)
         card.pack(fill="both", expand=True)
         ttk.Label(
             card,
-            text="Selecciona una reunión para previsualizar su transcripción. El título se extrae localmente del texto.",
+            text="Selecciona una reunión para previsualizar su transcripción y cambiar su nombre.",
             style="Muted.Card.TLabel",
         ).pack(anchor="w", padx=16, pady=(14, 10))
 
@@ -526,6 +549,7 @@ class MeetingControlApp:
         self.open_transcript_button.configure(state="disabled")
         self.open_summary_button.configure(state="disabled")
         self.copy_transcript_button.configure(state="disabled")
+        self.rename_meeting_button.configure(state="disabled")
         self.preview_title_label.configure(text="Previsualización de la transcripción")
         self._set_transcript_preview("")
 
@@ -541,9 +565,10 @@ class MeetingControlApp:
             self.open_transcript_button.configure(state="disabled")
             self.open_summary_button.configure(state="disabled")
             self.copy_transcript_button.configure(state="disabled")
+            self.rename_meeting_button.configure(state="disabled")
             return
         try:
-            self._selected_transcript_text = entry.transcript_path.read_text(encoding="utf-8")
+            self._selected_transcript_text = entry.transcript_path.read_text(encoding="utf-8-sig")
         except (OSError, UnicodeError) as exc:
             self._selected_transcript_text = ""
             logger.exception("Could not load meeting transcript %s", entry.transcript_path)
@@ -555,6 +580,58 @@ class MeetingControlApp:
         self.preview_title_label.configure(text=entry.title)
         self.open_transcript_button.configure(state="normal")
         self.open_summary_button.configure(state="normal" if entry.summary_path is not None else "disabled")
+        self.rename_meeting_button.configure(state="normal")
+
+    def _rename_selected_meeting(self) -> None:
+        selection = self.meetings_table.selection()
+        if not selection:
+            return
+        item_id = selection[0]
+        entry = self._meeting_entries.get(item_id)
+        if entry is None:
+            return
+
+        new_title = simpledialog.askstring(
+            "Cambiar nombre de la reunión",
+            "Escribe el nuevo nombre:",
+            initialvalue=entry.title,
+            parent=self.root,
+        )
+        if new_title is None:
+            return
+        new_title = new_title.strip()
+        if not new_title:
+            messagebox.showwarning(
+                "Nombre no válido",
+                "El nombre de la reunión no puede quedar vacío.",
+                parent=self.root,
+            )
+            return
+        if new_title == entry.title:
+            return
+
+        title_path = entry.transcript_path.parent / MEETING_TITLE_FILENAME
+        try:
+            title_path.write_text(new_title + "\n", encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            logger.exception("Could not save manual meeting title to %s", title_path)
+            messagebox.showerror(
+                "No se pudo cambiar el nombre",
+                f"No se pudo guardar el nuevo nombre de la reunión:\n{exc}",
+                parent=self.root,
+            )
+            return
+
+        self._meeting_entries[item_id] = MeetingEntry(
+            title=new_title,
+            meeting_date=entry.meeting_date,
+            duration_seconds=entry.duration_seconds,
+            transcript_path=entry.transcript_path,
+            summary_path=entry.summary_path,
+        )
+        values = self.meetings_table.item(item_id, "values")
+        self.meetings_table.item(item_id, values=(new_title, *values[1:]))
+        self.preview_title_label.configure(text=new_title)
 
     def _set_transcript_preview(self, content: str) -> None:
         self.transcript_preview.configure(state="normal")
@@ -897,7 +974,11 @@ class MeetingControlApp:
             self._messages.put(
                 ProcessingPhase("TRANSCRIBIENDO", "Transcripcion local con faster-whisper...", "transcribing")
             )
-            transcript = transcriber.transcribe(recording.mixed_wav, output_dir)
+            transcript = transcriber.transcribe_tracks(
+                [("Yo", recording.microphone_raw_wav), ("Participantes", recording.system_raw_wav)],
+                output_dir,
+                fallback_audio=recording.mixed_wav,
+            )
 
             report_path: Path | None = None
             analysis_path: Path | None = None
@@ -922,7 +1003,7 @@ class MeetingControlApp:
                 analysis_path = output_dir / "meeting_analysis.md"
                 analysis_path.write_text(
                     summarizer.build_meeting_analysis(cleaned_transcript).strip() + "\n",
-                    encoding="utf-8",
+                    encoding="utf-8-sig",
                 )
 
         except Exception as exc:

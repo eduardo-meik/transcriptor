@@ -157,7 +157,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _force_utf8_console() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
 def main() -> int:
+    _force_utf8_console()
     args = parse_args()
     config = load_config()
 
@@ -249,7 +260,11 @@ def main() -> int:
             print("Transcribing with WhisperX and optional diarization...")
         else:
             print("Transcribing locally with faster-whisper...")
-        transcript = transcriber.transcribe(recording.mixed_wav, output_dir)
+        transcript = transcriber.transcribe_tracks(
+            [("Yo", recording.microphone_raw_wav), ("Participantes", recording.system_raw_wav)],
+            output_dir,
+            fallback_audio=recording.mixed_wav,
+        )
         print(f"Saved transcript: {transcript.markdown_path}")
 
         if not args.no_summary:
@@ -270,18 +285,18 @@ def main() -> int:
             cleaned_transcript = summarizer.cleanup_transcript(transcript.text)
             if cleaned_transcript != transcript.text:
                 cleaned_path = output_dir / "transcript_cleaned.md"
-                cleaned_path.write_text(cleaned_transcript.strip() + "\n", encoding="utf-8")
+                cleaned_path.write_text(cleaned_transcript.strip() + "\n", encoding="utf-8-sig")
                 print(f"Saved cleaned transcript: {cleaned_path}")
 
             if args.analysis_only:
                 analysis_path = output_dir / "meeting_analysis.md"
-                analysis_path.write_text(summarizer.build_meeting_analysis(cleaned_transcript).strip() + "\n", encoding="utf-8")
+                analysis_path.write_text(summarizer.build_meeting_analysis(cleaned_transcript).strip() + "\n", encoding="utf-8-sig")
                 print(f"Saved analysis: {analysis_path}")
             else:
                 report_path = summarizer.summarize_to_file(cleaned_transcript, output_dir)
                 print(f"Saved report: {report_path}")
                 analysis_path = output_dir / "meeting_analysis.md"
-                analysis_path.write_text(summarizer.build_meeting_analysis(cleaned_transcript).strip() + "\n", encoding="utf-8")
+                analysis_path.write_text(summarizer.build_meeting_analysis(cleaned_transcript).strip() + "\n", encoding="utf-8-sig")
                 print(f"Saved analysis: {analysis_path}")
 
         print(f"Done. Output folder: {output_dir}")
